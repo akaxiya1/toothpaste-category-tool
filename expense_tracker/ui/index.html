@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>秒级记账</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
+    .kbd { @apply px-1.5 py-0.5 text-xs bg-slate-200 border border-slate-300 rounded; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+<div class="max-w-3xl mx-auto p-6 space-y-6">
+  <header class="flex items-baseline justify-between">
+    <h1 class="text-2xl font-semibold">秒级记账</h1>
+    <a class="text-sm text-blue-600 underline" href="/export.csv">导出 CSV</a>
+  </header>
+
+  <section class="bg-white shadow-sm rounded-xl p-5 space-y-3">
+    <h2 class="font-medium">粘贴账单文本</h2>
+    <p class="text-sm text-slate-500">
+      在微信/支付宝复制账单后，按
+      <span class="kbd">Ctrl/Cmd + V</span> 粘贴，再按
+      <span class="kbd">Enter</span> 解析。
+    </p>
+    <textarea id="raw"
+      rows="3"
+      class="w-full border border-slate-300 rounded-lg p-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
+      placeholder="例：微信支付 -15.00元 商户：瑞幸咖啡"></textarea>
+    <div class="flex gap-2">
+      <button id="parseBtn" class="bg-blue-600 text-white px-4 py-1.5 rounded-md text-sm">解析</button>
+      <button id="pasteBtn" class="bg-slate-100 text-slate-700 px-3 py-1.5 rounded-md text-sm">读取剪贴板</button>
+      <span id="hint" class="text-sm text-slate-500 self-center"></span>
+    </div>
+  </section>
+
+  <section id="preview" class="bg-white shadow-sm rounded-xl p-5 space-y-3 hidden">
+    <h2 class="font-medium">解析结果</h2>
+    <div class="grid grid-cols-2 gap-3 text-sm">
+      <label>金额 <input id="f-amount" type="number" step="0.01" class="w-full border rounded p-1.5" /></label>
+      <label>方向
+        <select id="f-direction" class="w-full border rounded p-1.5">
+          <option value="expense">支出</option>
+          <option value="income">收入</option>
+          <option value="refund">退款</option>
+          <option value="transfer">转账</option>
+        </select>
+      </label>
+      <label>商户 <input id="f-merchant" class="w-full border rounded p-1.5" /></label>
+      <label>账户 <input id="f-account" class="w-full border rounded p-1.5" placeholder="微信/支付宝/卡尾号" /></label>
+      <label>分类 <input id="f-category" class="w-full border rounded p-1.5" /></label>
+      <label>子分类 <input id="f-subcategory" class="w-full border rounded p-1.5" /></label>
+      <label class="col-span-2">发生时间 <input id="f-occurred" class="w-full border rounded p-1.5" /></label>
+      <label class="col-span-2">备注 <input id="f-note" class="w-full border rounded p-1.5" /></label>
+    </div>
+    <div id="confBanner" class="text-sm rounded-md p-2"></div>
+    <div class="flex gap-2 justify-end">
+      <button id="cancelBtn" class="text-slate-500 px-3">取消 (Esc)</button>
+      <button id="confirmBtn" class="bg-emerald-600 text-white px-4 py-1.5 rounded-md text-sm">确认 (Enter)</button>
+    </div>
+  </section>
+
+  <section class="bg-white shadow-sm rounded-xl p-5 space-y-3">
+    <div class="flex justify-between items-center">
+      <h2 class="font-medium">最近流水</h2>
+      <button id="refreshBtn" class="text-sm text-blue-600">刷新</button>
+    </div>
+    <div id="txList" class="divide-y text-sm"></div>
+  </section>
+
+  <section class="bg-white shadow-sm rounded-xl p-5 space-y-3">
+    <h2 class="font-medium">近 30 天分类统计</h2>
+    <div id="stats" class="text-sm text-slate-700"></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let preview = null;
+
+async function parseText() {
+  const text = $("raw").value.trim();
+  if (!text) return;
+  $("hint").textContent = "解析中...";
+  try {
+    const r = await fetch("/intake", { method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({text}) });
+    if (!r.ok) { $("hint").textContent = "无法解析: " + await r.text(); return; }
+    preview = await r.json();
+    $("hint").textContent = "";
+    showPreview(preview);
+  } catch (e) { $("hint").textContent = "网络错误"; }
+}
+
+function showPreview(p) {
+  $("preview").classList.remove("hidden");
+  $("f-amount").value = p.amount ?? "";
+  $("f-direction").value = p.direction;
+  $("f-merchant").value = p.merchant ?? "";
+  $("f-account").value = p.account ?? "";
+  $("f-category").value = p.category;
+  $("f-subcategory").value = p.subcategory ?? "";
+  $("f-occurred").value = p.occurred_at ?? "";
+  $("f-note").value = "";
+  const banner = $("confBanner");
+  const conf = Math.round((p.confidence || 0) * 100);
+  if (p.needs_confirmation) {
+    banner.className = "text-sm rounded-md p-2 bg-amber-50 text-amber-700 border border-amber-200";
+    banner.textContent = `置信度 ${conf}% (来源: ${p.classifier_source}) — 请确认或修正后再保存。`;
+  } else {
+    banner.className = "text-sm rounded-md p-2 bg-emerald-50 text-emerald-700 border border-emerald-200";
+    banner.textContent = `置信度 ${conf}% (来源: ${p.classifier_source}) — 按 Enter 直接确认。`;
+  }
+  $("f-amount").focus();
+}
+
+async function confirm() {
+  if (!preview) return;
+  const body = {
+    amount: parseFloat($("f-amount").value),
+    direction: $("f-direction").value,
+    merchant: $("f-merchant").value || null,
+    account: $("f-account").value || null,
+    category: $("f-category").value || "其他",
+    subcategory: $("f-subcategory").value || null,
+    occurred_at: $("f-occurred").value || null,
+    raw_text: preview.raw_text,
+    note: $("f-note").value || null,
+    confidence: preview.confidence,
+    source: "manual",
+  };
+  const r = await fetch("/transactions", { method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+  if (r.status === 409) { alert("重复账单 (dedup)"); return; }
+  if (!r.ok) { alert("保存失败"); return; }
+  reset(); refresh();
+}
+
+function reset() {
+  preview = null;
+  $("preview").classList.add("hidden");
+  $("raw").value = "";
+  $("raw").focus();
+}
+
+async function refresh() {
+  const txs = await (await fetch("/transactions?limit=20")).json();
+  const list = $("txList");
+  list.innerHTML = "";
+  for (const t of txs) {
+    const sign = t.direction === "expense" ? "-" : "+";
+    const cls = t.direction === "expense" ? "text-rose-600" : "text-emerald-600";
+    list.insertAdjacentHTML("beforeend", `
+      <div class="py-2 flex justify-between gap-3">
+        <div>
+          <div class="font-medium">${t.merchant ?? "(未知商户)"} <span class="text-xs text-slate-400 ml-1">${t.category}/${t.subcategory ?? ""}</span></div>
+          <div class="text-xs text-slate-500">${t.occurred_at} · ${t.account ?? ""} · ${t.source}</div>
+        </div>
+        <div class="${cls} font-mono">${sign}¥${Number(t.amount).toFixed(2)}</div>
+      </div>`);
+  }
+  const stats = await (await fetch("/stats/category")).json();
+  $("stats").innerHTML = stats.map(s =>
+    `<div class="flex justify-between border-b py-1"><span>${s.category ?? "其他"}</span>
+     <span class="font-mono">¥${s.total} (${s.count})</span></div>`).join("") || "<em>暂无数据</em>";
+}
+
+$("parseBtn").onclick = parseText;
+$("confirmBtn").onclick = confirm;
+$("cancelBtn").onclick = reset;
+$("refreshBtn").onclick = refresh;
+$("pasteBtn").onclick = async () => {
+  try { $("raw").value = await navigator.clipboard.readText(); parseText(); }
+  catch { $("hint").textContent = "浏览器拒绝读取剪贴板，请手动粘贴"; }
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.target.id === "raw" || e.target.tagName === "INPUT")) {
+    if (e.target.id === "raw") { e.preventDefault(); parseText(); }
+    else if (preview) { e.preventDefault(); confirm(); }
+  } else if (e.key === "Escape") { reset(); }
+});
+
+refresh();
+</script>
+</body>
+</html>
