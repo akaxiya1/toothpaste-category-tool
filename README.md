@@ -220,4 +220,44 @@ parser 通过 `+/-`、`退款 / 到账 / 转入 / 转出` 等关键词推断；�
 
 ---
 
+## V2.1 增量（便利性 + 粘性）
+
+四个聚焦"日常便利 + 粘性"的模块，全部默认开（除了微信推送要你贴 SENDKEY）。
+
+| 模块 | 文件 | 端点 | 配置入口 |
+| --- | --- | --- | --- |
+| **Top-3 候选 + 数字键直选** | `modules/candidates.py` | `/intake` 响应新增 `candidates[]` | `features.top_k_candidates: true` |
+| **商户别名归一** | `modules/merchant_alias.py` | `GET/POST/DELETE /aliases` | `features.merchant_alias: true` |
+| **预算可视化 + 异常预警** | `modules/budget_alerts.py` | `/budgets/status`、`/alerts` | `features.budget_alerts: true` + `budgets.monthly.*` |
+| **每日 22:00 总结（微信推送）** | `modules/daily_digest.py` + `modules/notifier.py` | `/digest/today`、`/digest/test` | `features.daily_digest` 子节点 |
+
+### 怎么把日报推到你微信
+1. 打开 https://sct.ftqq.com/ ，用 GitHub 登录，拿到你的 `SENDKEY`（`SCT` 开头）。
+2. 编辑 `expense_tracker/config.yaml`：
+   ```yaml
+   features:
+     daily_digest:
+       enabled: true
+       time: "22:00"
+       notifier: wechat
+       wechat_sendkey: SCTxxxxxxxxxxxxxxxx
+   ```
+3. 重启服务，首次推送会在手机上弹出"确认绑定" → 同意即可。
+4. 在 UI 右上角"设置 → 每日总结 → 推送测试" 也能立刻触发一次，确认通了再等 22:00。
+
+### UI 变化（仍是 Tailwind + 原生 JS，不依赖框架）
+- 粘贴 → 解析 → **按 `1` / `2` / `3`** 直接落库。
+- 顶部出现 **环形进度条**（本月预算使用率，低/正常/警告/超支四色）。
+- 出现"咖啡支出 +80% / 某新商户单笔 ¥500"时顶部弹 **琥珀色 alert 胶囊**。
+- 落库后 30 秒内按 `Ctrl+Z` **一键撤销**（复用 V1 软删除）。
+- 解析时若检测到新旧商户疑似同一家，弹 **"一键合并"** 提示。
+- 右上角 **设置** 抽屉：管理别名 / 预览今日总结 / 推送测试。
+
+### 测试 / 规模
+- V2.1 新增 30 个测试，合计 **81 个用例全部通过**。
+- 不碰 V1 核心（`dedup_hash` / `direction` / `confidence_threshold` / `pluggable_ai`），
+  不碰 V2 已验证的 `time_decay` / `split` / `fx` / `rules_versioning` / `desensitize`。
+
+---
+
 如需在本仓库继续迭代，开发分支为 `claude/expense-tracker-clipboard-nyc9M`。

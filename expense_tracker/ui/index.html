@@ -7,25 +7,35 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
-    .kbd { @apply px-1.5 py-0.5 text-xs bg-slate-200 border border-slate-300 rounded; }
+    .kbd { padding: 1px 6px; font-size: 11px; background: #e2e8f0; border: 1px solid #cbd5e1; border-radius: 4px; }
+    .ring-bg { fill: none; stroke: #e2e8f0; stroke-width: 6; }
+    .ring-fg { fill: none; stroke-width: 6; stroke-linecap: round; transform: rotate(-90deg); transform-origin: center; transition: stroke-dashoffset .4s ease; }
+    .ring-low  { stroke: #10b981; }
+    .ring-ok   { stroke: #3b82f6; }
+    .ring-warn { stroke: #f59e0b; }
+    .ring-over { stroke: #ef4444; }
   </style>
 </head>
 <body class="bg-slate-50 text-slate-800">
 <div class="max-w-3xl mx-auto p-6 space-y-6">
   <header class="flex items-baseline justify-between">
     <h1 class="text-2xl font-semibold">秒级记账</h1>
-    <a class="text-sm text-blue-600 underline" href="/export.csv">导出 CSV</a>
+    <div class="flex items-center gap-3 text-sm">
+      <button id="settingsBtn" class="text-blue-600">设置</button>
+      <a class="text-blue-600 underline" href="/export.csv">导出 CSV</a>
+    </div>
   </header>
+
+  <div id="alertBar" class="hidden"></div>
+  <div id="budgetRings" class="hidden bg-white shadow-sm rounded-xl p-4"></div>
 
   <section class="bg-white shadow-sm rounded-xl p-5 space-y-3">
     <h2 class="font-medium">粘贴账单文本</h2>
     <p class="text-sm text-slate-500">
-      在微信/支付宝复制账单后，按
-      <span class="kbd">Ctrl/Cmd + V</span> 粘贴，再按
-      <span class="kbd">Enter</span> 解析。
+      粘贴后按 <span class="kbd">Enter</span> 解析；解析完成后按
+      <span class="kbd">1</span> <span class="kbd">2</span> <span class="kbd">3</span> 直接落库。
     </p>
-    <textarea id="raw"
-      rows="3"
+    <textarea id="raw" rows="3"
       class="w-full border border-slate-300 rounded-lg p-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
       placeholder="例：微信支付 -15.00元 商户：瑞幸咖啡"></textarea>
     <div class="flex gap-2">
@@ -36,7 +46,15 @@
   </section>
 
   <section id="preview" class="bg-white shadow-sm rounded-xl p-5 space-y-3 hidden">
-    <h2 class="font-medium">解析结果</h2>
+    <div class="flex items-center justify-between">
+      <h2 class="font-medium">解析结果</h2>
+      <button id="undoBtn" class="hidden text-xs text-slate-500 hover:text-slate-700" title="撤销最近一笔">撤销</button>
+    </div>
+
+    <div id="aliasSuggest" class="hidden text-sm rounded-md p-2 bg-indigo-50 text-indigo-800 border border-indigo-200"></div>
+
+    <div id="candidates" class="hidden space-y-1.5"></div>
+
     <div class="grid grid-cols-2 gap-3 text-sm">
       <label>金额 <input id="f-amount" type="number" step="0.01" class="w-full border rounded p-1.5" /></label>
       <label>方向
@@ -75,9 +93,51 @@
   </section>
 </div>
 
+<!-- Settings drawer -->
+<div id="settings" class="fixed inset-0 bg-black/30 hidden z-10" role="dialog">
+  <div class="absolute right-0 top-0 h-full w-full max-w-md bg-white p-5 overflow-y-auto space-y-5">
+    <div class="flex justify-between items-center">
+      <h2 class="text-lg font-semibold">设置</h2>
+      <button id="settingsClose" class="text-slate-500">关闭</button>
+    </div>
+
+    <div id="settingsFeatures" class="text-xs text-slate-500"></div>
+
+    <div>
+      <h3 class="font-medium mb-2">商户别名</h3>
+      <p class="text-xs text-slate-500 mb-2">把"瑞幸咖啡(上海店)"映射到"瑞幸咖啡"，避免学习闭环分裂。</p>
+      <div class="flex gap-2 mb-2">
+        <input id="aliasFrom" placeholder="别名" class="flex-1 border rounded p-1.5 text-sm" />
+        <input id="aliasTo" placeholder="标准名" class="flex-1 border rounded p-1.5 text-sm" />
+        <button id="aliasAdd" class="bg-blue-600 text-white px-3 rounded text-sm">合并</button>
+      </div>
+      <div id="aliasList" class="text-sm space-y-1"></div>
+    </div>
+
+    <div>
+      <h3 class="font-medium mb-2">每日总结</h3>
+      <p class="text-xs text-slate-500 mb-2">在 <code>config.yaml</code> 打开后，这里可以预览今天的总结文案，或立刻推送一次测试。</p>
+      <div class="flex gap-2">
+        <button id="digestPreview" class="bg-slate-100 px-3 py-1.5 rounded text-sm">预览今日</button>
+        <button id="digestTest" class="bg-slate-100 px-3 py-1.5 rounded text-sm">推送测试</button>
+      </div>
+      <pre id="digestOut" class="mt-2 text-xs whitespace-pre-wrap bg-slate-50 border rounded p-2 hidden"></pre>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 let preview = null;
+let features = {};
+let lastInsertId = null;
+let undoTimer = null;
+
+async function loadFeatures() {
+  try { features = await (await fetch("/features")).json(); } catch { features = {}; }
+  $("settingsFeatures").textContent = "已启用: " + Object.entries(features)
+    .filter(([,v]) => v).map(([k]) => k).join(", ");
+}
 
 async function parseText() {
   const text = $("raw").value.trim();
@@ -103,16 +163,64 @@ function showPreview(p) {
   $("f-subcategory").value = p.subcategory ?? "";
   $("f-occurred").value = p.occurred_at ?? "";
   $("f-note").value = "";
+
+  // alias suggestion
+  const aliasBox = $("aliasSuggest");
+  if (p.alias_suggestion) {
+    const s = p.alias_suggestion;
+    aliasBox.innerHTML = `检测到相似商户 <b>${s.canonical}</b> (原因: ${s.reason})，
+      <a class="underline cursor-pointer" id="aliasAccept">一键合并</a> ·
+      <a class="underline cursor-pointer text-slate-500" id="aliasDismiss">忽略</a>`;
+    aliasBox.classList.remove("hidden");
+    $("aliasAccept").onclick = async () => {
+      await fetch("/aliases", { method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({alias: s.alias, canonical: s.canonical, merge_history: true})});
+      $("f-merchant").value = s.canonical;
+      aliasBox.classList.add("hidden");
+    };
+    $("aliasDismiss").onclick = () => aliasBox.classList.add("hidden");
+  } else {
+    aliasBox.classList.add("hidden");
+  }
+
+  // candidates
+  const cands = $("candidates");
+  if (p.candidates && p.candidates.length) {
+    cands.innerHTML = p.candidates.map((c, i) => {
+      const confPct = Math.round(c.confidence * 100);
+      return `<button class="w-full text-left px-3 py-2 rounded-md border hover:bg-blue-50 flex justify-between items-center"
+                      data-idx="${i}">
+        <span><span class="kbd mr-2">${i+1}</span>${c.category}${c.subcategory ? ' · ' + c.subcategory : ''}</span>
+        <span class="text-xs text-slate-400">${confPct}% · ${c.source}</span>
+      </button>`;
+    }).join("");
+    cands.classList.remove("hidden");
+    [...cands.querySelectorAll("button")].forEach(btn => {
+      btn.onclick = () => pickCandidate(parseInt(btn.dataset.idx));
+    });
+  } else {
+    cands.classList.add("hidden");
+  }
+
   const banner = $("confBanner");
   const conf = Math.round((p.confidence || 0) * 100);
   if (p.needs_confirmation) {
     banner.className = "text-sm rounded-md p-2 bg-amber-50 text-amber-700 border border-amber-200";
-    banner.textContent = `置信度 ${conf}% (来源: ${p.classifier_source}) — 请确认或修正后再保存。`;
+    banner.textContent = `置信度 ${conf}% (来源: ${p.classifier_source}) — 请确认或按 1/2/3 选分类。`;
   } else {
     banner.className = "text-sm rounded-md p-2 bg-emerald-50 text-emerald-700 border border-emerald-200";
-    banner.textContent = `置信度 ${conf}% (来源: ${p.classifier_source}) — 按 Enter 直接确认。`;
+    banner.textContent = `置信度 ${conf}% — 按 Enter 直接确认，或 1/2/3 快速改分类。`;
   }
   $("f-amount").focus();
+}
+
+function pickCandidate(i) {
+  if (!preview || !preview.candidates || !preview.candidates[i]) return;
+  const c = preview.candidates[i];
+  $("f-category").value = c.category;
+  $("f-subcategory").value = c.subcategory ?? "";
+  confirm();
 }
 
 async function confirm() {
@@ -134,7 +242,27 @@ async function confirm() {
     headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
   if (r.status === 409) { alert("重复账单 (dedup)"); return; }
   if (!r.ok) { alert("保存失败"); return; }
+  const result = await r.json();
+  lastInsertId = result.id;
+  showUndo();
   reset(); refresh();
+}
+
+function showUndo() {
+  const btn = $("undoBtn");
+  btn.classList.remove("hidden");
+  btn.textContent = "撤销最近一笔 (Ctrl+Z, 30s内)";
+  clearTimeout(undoTimer);
+  undoTimer = setTimeout(() => { btn.classList.add("hidden"); lastInsertId = null; }, 30000);
+}
+
+async function undoLast() {
+  if (!lastInsertId) return;
+  const id = lastInsertId;
+  lastInsertId = null;
+  await fetch("/transactions/" + id, { method: "DELETE" });
+  $("undoBtn").classList.add("hidden");
+  refresh();
 }
 
 function reset() {
@@ -142,6 +270,22 @@ function reset() {
   $("preview").classList.add("hidden");
   $("raw").value = "";
   $("raw").focus();
+}
+
+function renderRing(item) {
+  const r = 28, c = 2 * Math.PI * r;
+  const pct = Math.min(item.pct, 100);
+  const off = c * (1 - pct / 100);
+  const cls = `ring-${item.state}`;
+  return `<div class="text-center">
+    <svg viewBox="0 0 64 64" width="64" height="64">
+      <circle class="ring-bg" cx="32" cy="32" r="${r}" />
+      <circle class="ring-fg ${cls}" cx="32" cy="32" r="${r}"
+              stroke-dasharray="${c}" stroke-dashoffset="${off}" />
+    </svg>
+    <div class="text-xs mt-1">${item.category}</div>
+    <div class="text-xs text-slate-500">${item.pct}% · 剩 ¥${item.remaining}</div>
+  </div>`;
 }
 
 async function refresh() {
@@ -164,25 +308,104 @@ async function refresh() {
   $("stats").innerHTML = stats.map(s =>
     `<div class="flex justify-between border-b py-1"><span>${s.category ?? "其他"}</span>
      <span class="font-mono">¥${s.total} (${s.count})</span></div>`).join("") || "<em>暂无数据</em>";
+
+  if (features.budget_alerts) {
+    try {
+      const [budget, alerts] = await Promise.all([
+        fetch("/budgets/status").then(r => r.json()),
+        fetch("/alerts").then(r => r.json()),
+      ]);
+      if (budget.length) {
+        $("budgetRings").classList.remove("hidden");
+        $("budgetRings").innerHTML = `<div class="flex gap-4 overflow-x-auto">${budget.map(renderRing).join("")}</div>`;
+      }
+      if (alerts.length) {
+        const msg = alerts.slice(0, 3).map(a => {
+          if (a.kind === "category_spike") return `${a.category} 近 30 天日均 ¥${a.recent_daily_avg} (基线 ¥${a.baseline_daily_avg}, z=${a.z})`;
+          if (a.kind === "new_merchant_spike") return `新商户 ${a.merchant} 单笔 ¥${a.amount} (中位 ¥${a.median})`;
+          return JSON.stringify(a);
+        }).join(" · ");
+        $("alertBar").classList.remove("hidden");
+        $("alertBar").className = "rounded-md p-3 bg-amber-50 border border-amber-200 text-sm text-amber-800";
+        $("alertBar").innerHTML = "⚠ " + msg;
+      } else {
+        $("alertBar").classList.add("hidden");
+      }
+    } catch {}
+  }
+}
+
+async function loadAliases() {
+  if (!features.merchant_alias) return;
+  const rows = await (await fetch("/aliases")).json();
+  $("aliasList").innerHTML = rows.map(r => `
+    <div class="flex justify-between items-center border-b py-1">
+      <span>${r.alias} → <b>${r.canonical}</b></span>
+      <button data-alias="${r.alias}" class="text-rose-600 text-xs remove-alias">删除</button>
+    </div>`).join("") || "<em class='text-slate-400'>尚无别名</em>";
+  [...document.querySelectorAll(".remove-alias")].forEach(b => {
+    b.onclick = async () => {
+      await fetch("/aliases/" + encodeURIComponent(b.dataset.alias), { method: "DELETE" });
+      loadAliases();
+    };
+  });
 }
 
 $("parseBtn").onclick = parseText;
 $("confirmBtn").onclick = confirm;
 $("cancelBtn").onclick = reset;
 $("refreshBtn").onclick = refresh;
+$("undoBtn").onclick = undoLast;
 $("pasteBtn").onclick = async () => {
   try { $("raw").value = await navigator.clipboard.readText(); parseText(); }
   catch { $("hint").textContent = "浏览器拒绝读取剪贴板，请手动粘贴"; }
 };
 
+$("settingsBtn").onclick = () => { $("settings").classList.remove("hidden"); loadAliases(); };
+$("settingsClose").onclick = () => $("settings").classList.add("hidden");
+$("aliasAdd").onclick = async () => {
+  const a = $("aliasFrom").value.trim(), c = $("aliasTo").value.trim();
+  if (!a || !c) return;
+  await fetch("/aliases", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({alias: a, canonical: c, merge_history: true}) });
+  $("aliasFrom").value = ""; $("aliasTo").value = "";
+  loadAliases();
+};
+$("digestPreview").onclick = async () => {
+  if (!features.daily_digest) { $("digestOut").textContent = "daily_digest 未启用，请在 config.yaml 打开"; $("digestOut").classList.remove("hidden"); return; }
+  const d = await (await fetch("/digest/today")).json();
+  $("digestOut").textContent = d.title + "\n\n" + d.body;
+  $("digestOut").classList.remove("hidden");
+};
+$("digestTest").onclick = async () => {
+  if (!features.daily_digest) return;
+  const r = await fetch("/digest/test", { method: "POST" });
+  const j = await r.json();
+  $("digestOut").textContent = j.sent ? "已推送到微信 ✓" : "推送失败，请检查 SENDKEY";
+  $("digestOut").classList.remove("hidden");
+};
+
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.target.id === "raw" || e.target.tagName === "INPUT")) {
-    if (e.target.id === "raw") { e.preventDefault(); parseText(); }
-    else if (preview) { e.preventDefault(); confirm(); }
+  if (e.ctrlKey && e.key.toLowerCase() === "z" && lastInsertId) { e.preventDefault(); undoLast(); return; }
+  if (!preview) {
+    if (e.key === "Enter" && e.target.id === "raw") { e.preventDefault(); parseText(); }
+    return;
+  }
+  // while preview visible
+  if (e.key >= "1" && e.key <= "9") {
+    const idx = parseInt(e.key) - 1;
+    if (preview.candidates && preview.candidates[idx] && e.target.tagName !== "INPUT" && e.target.tagName !== "TEXTAREA") {
+      e.preventDefault();
+      pickCandidate(idx);
+      return;
+    }
+  }
+  if (e.key === "Enter" && e.target.tagName === "INPUT") {
+    e.preventDefault(); confirm();
   } else if (e.key === "Escape") { reset(); }
 });
 
-refresh();
+loadFeatures().then(refresh);
 </script>
 </body>
 </html>

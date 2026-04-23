@@ -77,7 +77,62 @@ _extended_exporters = _feat("extended_exporters")
 if _extended_exporters:
     from .modules.exporters import to_beancount, to_gnucash_csv, privacy_stats
 
-app = FastAPI(title="Expense Tracker", version="0.2.0")
+# ----- V2.1 feature flags -----
+
+_alias = None
+if _feat("merchant_alias"):
+    from .modules.merchant_alias import MerchantAlias
+    _alias = MerchantAlias(db)
+
+_top_k = _feat("top_k_candidates")
+if _top_k:
+    from .modules.candidates import top_candidates
+
+_budget_alerts = _feat("budget_alerts")
+if _budget_alerts:
+    from .modules.budget_alerts import budget_status, detect_anomalies
+
+_digest_cfg = _cfg.get("features", {}).get("daily_digest") or {}
+_digest_enabled = bool(_digest_cfg.get("enabled"))
+_digest_scheduler = None
+_digest_notifier = None
+if _digest_enabled:
+    from .modules.daily_digest import DigestScheduler, build_digest, run_digest_job
+    from .modules.notifier import build as build_notifier
+    try:
+        _digest_notifier = build_notifier(_digest_cfg)
+    except ValueError as exc:
+        print(f"[digest] notifier config invalid: {exc}; digest disabled")
+        _digest_enabled = False
+
+BUDGETS_MONTHLY = (_cfg.get("budgets") or {}).get("monthly") or {}
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global _digest_scheduler
+    if _digest_enabled and _digest_notifier is not None:
+        from .modules.daily_digest import DigestScheduler, run_digest_job
+        raw_time = (_digest_cfg.get("time") or "22:00").strip()
+        try:
+            hh, mm = (int(x) for x in raw_time.split(":", 1))
+        except ValueError:
+            hh, mm = 22, 0
+        _digest_scheduler = DigestScheduler(
+            hh, mm, lambda: run_digest_job(db, _digest_notifier)
+        )
+        _digest_scheduler.start()
+        print(f"[digest] scheduled daily at {hh:02d}:{mm:02d}")
+    try:
+        yield
+    finally:
+        if _digest_scheduler is not None:
+            _digest_scheduler.stop()
+
+
+app = FastAPI(title="Expense Tracker", version="0.3.0", lifespan=_lifespan)
 UI_DIR = Path(__file__).parent / "ui"
 
 
@@ -86,6 +141,20 @@ UI_DIR = Path(__file__).parent / "ui"
 class IntakeRequest(BaseModel):
     text: str
     source: str = "clipboard"
+
+
+class CandidateOut(BaseModel):
+    category: str
+    subcategory: Optional[str] = None
+    confidence: float
+    source: str
+
+
+class AliasSuggestionOut(BaseModel):
+    alias: str
+    canonical: str
+    score: float
+    reason: str
 
 
 class IntakeResponse(BaseModel):
@@ -102,6 +171,8 @@ class IntakeResponse(BaseModel):
     needs_confirmation: bool
     reason: str
     subscription_hint: Optional[str] = None
+    candidates: list[CandidateOut] = []
+    alias_suggestion: Optional[AliasSuggestionOut] = None
 
 
 class TransactionIn(BaseModel):
@@ -155,8 +226,29 @@ def intake(req: IntakeRequest) -> IntakeResponse:
     parsed = parse(text)
     if not parsed.is_valid:
         raise HTTPException(status_code=422, detail=f"unparseable: {parsed.reason}")
-    cls = classifier.classify(parsed.merchant, parsed.raw_text)
+
+    merchant = parsed.merchant
+    alias_sugg = None
+    if _alias is not None and merchant:
+        canonical = _alias.normalize(merchant)
+        if canonical != merchant:
+            merchant = canonical
+        else:
+            sugg = _alias.suggest(merchant)
+            if sugg:
+                alias_sugg = AliasSuggestionOut(**sugg.__dict__)
+
+    cls = classifier.classify(merchant, parsed.raw_text)
     needs_confirm = (parsed.confidence < 0.7) or (cls.confidence < 0.6)
+
+    candidates_out: list[CandidateOut] = []
+    if _top_k:
+        cands = top_candidates(classifier, merchant, parsed.raw_text, k=3)
+        candidates_out = [
+            CandidateOut(category=c.category, subcategory=c.subcategory,
+                         confidence=c.confidence, source=c.source)
+            for c in cands
+        ]
 
     sub_hint = None
     if _subs is not None:
@@ -171,7 +263,7 @@ def intake(req: IntakeRequest) -> IntakeResponse:
     return IntakeResponse(
         amount=parsed.amount,
         direction=parsed.direction,
-        merchant=parsed.merchant,
+        merchant=merchant,
         account=parsed.account,
         occurred_at=parsed.occurred_at,
         category=cls.category,
@@ -182,6 +274,8 @@ def intake(req: IntakeRequest) -> IntakeResponse:
         needs_confirmation=needs_confirm,
         reason=parsed.reason,
         subscription_hint=sub_hint,
+        candidates=candidates_out,
+        alias_suggestion=alias_sugg,
     )
 
 
@@ -202,9 +296,13 @@ def create_transaction(tx_in: TransactionIn) -> dict:
     if _desensitize is not None and raw_text:
         raw_text = _desensitize(raw_text)
 
+    merchant = tx_in.merchant
+    if _alias is not None and merchant:
+        merchant = _alias.normalize(merchant)
+
     tx = Transaction(
         amount=amount_base,
-        merchant=tx_in.merchant,
+        merchant=merchant,
         raw_text=raw_text,
         category=tx_in.category,
         subcategory=tx_in.subcategory,
@@ -218,8 +316,8 @@ def create_transaction(tx_in: TransactionIn) -> dict:
     new_id = db.insert_transaction(tx)
     if new_id is None:
         raise HTTPException(status_code=409, detail="duplicate transaction")
-    if tx_in.merchant and tx_in.category:
-        classifier.remember(tx_in.merchant, tx_in.category, tx_in.subcategory)
+    if merchant and tx_in.category:
+        classifier.remember(merchant, tx_in.category, tx_in.subcategory)
 
     if fx_attached and _fx is not None:
         _fx.attach(new_id, fx_attached["currency"], fx_attached["original_amount"])
@@ -230,8 +328,8 @@ def create_transaction(tx_in: TransactionIn) -> dict:
             hint = detect_subscription(raw_text)
             if hint:
                 cadence = hint.cadence
-        if cadence and tx_in.merchant:
-            _subs.record(tx_in.merchant, amount_base, cadence,
+        if cadence and merchant:
+            _subs.record(merchant, amount_base, cadence,
                          occurred_at=tx.occurred_at, tx_id=new_id)
 
     return {"id": new_id, "status": "created", "base_amount": amount_base}
@@ -326,6 +424,57 @@ if _extended_exporters:
         return JSONResponse(privacy_stats(rows))
 
 
+class AliasIn(BaseModel):
+    alias: str
+    canonical: str
+    merge_history: bool = False
+
+
+if _alias is not None:
+    @app.get("/aliases")
+    def list_aliases() -> list[dict]:
+        return _alias.list_all()
+
+    @app.post("/aliases")
+    def add_alias(payload: AliasIn) -> dict:
+        if payload.merge_history:
+            _alias.merge_history(payload.alias, payload.canonical)
+        else:
+            _alias.add(payload.alias, payload.canonical)
+        return {"status": "ok"}
+
+    @app.delete("/aliases/{alias}")
+    def delete_alias(alias: str) -> dict:
+        if not _alias.remove(alias):
+            raise HTTPException(status_code=404, detail="not found")
+        return {"status": "deleted"}
+
+
+if _budget_alerts:
+    @app.get("/budgets/status")
+    def get_budget_status() -> list[dict]:
+        return budget_status(db, BUDGETS_MONTHLY)
+
+    @app.get("/alerts")
+    def get_alerts(sigma: float = 2.0) -> list[dict]:
+        return detect_anomalies(db, sigma=sigma)
+
+
+if _digest_enabled:
+    from .modules.daily_digest import build_digest as _build_digest, run_digest_job as _run_digest
+
+    @app.get("/digest/today")
+    def digest_today() -> dict:
+        title, body = _build_digest(db)
+        return {"title": title, "body": body}
+
+    @app.post("/digest/test")
+    def digest_test() -> dict:
+        """Send the digest right now; useful to confirm the Server Chan key."""
+        ok = _run_digest(db, _digest_notifier)
+        return {"sent": ok}
+
+
 @app.get("/features")
 def get_features() -> dict:
     """Expose enabled features so the UI can show/hide sections."""
@@ -337,4 +486,8 @@ def get_features() -> dict:
         "multi_currency": _fx is not None,
         "rules_versioning": _rules is not None,
         "extended_exporters": _extended_exporters,
+        "top_k_candidates": _top_k,
+        "merchant_alias": _alias is not None,
+        "budget_alerts": _budget_alerts,
+        "daily_digest": _digest_enabled,
     }

@@ -5,6 +5,28 @@ features:
   # Hook that strips PII from raw_text before it is persisted.
   desensitize: true
 
+  # Return top-3 classification candidates so the UI can offer
+  # "press 1/2/3 to pick". Adds negligible latency.
+  top_k_candidates: true
+
+  # Merchant-name normalisation. /aliases endpoints let the UI manage
+  # the mapping; ``suggest`` proposes merges but never auto-merges.
+  merchant_alias: true
+
+  # Monthly budget progress + anomaly alerts. Informational only --
+  # never blocks inserts.
+  budget_alerts: true
+
+  # Daily 22:00 digest (default). Set ``notifier: wechat`` + plug in a
+  # Server Chan SENDKEY for personal WeChat push.
+  daily_digest:
+    enabled: false
+    time: "22:00"
+    notifier: wechat           # null / desktop / wechat / webhook
+    wechat_sendkey: ""         # paste your SCTxxxxxx here
+    webhook_url: ""
+    webhook_template: ""       # optional JSON template for webhook
+
   # Decaying merchant_history weights (30-day half-life by default).
   time_decay:
     enabled: false
