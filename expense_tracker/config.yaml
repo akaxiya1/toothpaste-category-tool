@@ -1,0 +1,53 @@
+# V2 feature flags -- defaults are conservative (opt-in, local-first).
+# Reloaded on-the-fly via `modules.config_loader.watch()` (mtime polling).
+
+features:
+  # Hook that strips PII from raw_text before it is persisted.
+  desensitize: true
+
+  # Decaying merchant_history weights (30-day half-life by default).
+  time_decay:
+    enabled: false
+    half_life_days: 30
+    min_weight: 0.15       # below this we fall through to keyword rules
+    new_boost_days: 7      # entries younger than this get boosted
+
+  # Split a single transaction into multiple category slices.
+  split_transactions: false
+
+  # FX conversion; CNY stays the default base currency.
+  multi_currency:
+    enabled: false
+    base: CNY
+    rate_file: fx_rates.json    # relative to data dir, loaded lazily
+
+  # Detect 自动续费/月付/年费 and keep a calendar.
+  subscription_calendar: false
+
+  # Snapshot category_map + keyword rules on each edit.
+  rules_versioning: false
+
+  # Beancount / GnuCash / privacy-stats exporters.
+  extended_exporters: true
+
+  # Native trigger bridge (watches an inbox dir populated by platform
+  # integrations: macOS Shortcuts / Windows PS / Android Tasker).
+  native_trigger:
+    enabled: false
+    inbox_dir: ~/Library/Application Support/expense_tracker/inbox
+    poll_interval: 1.0
+    delete_after_process: true
+
+  # SQLCipher-backed DB (key via EXPENSE_DB_KEY env var).
+  sqlcipher: false
+
+  # WebDAV sync plugin -- stub only, no network in default build.
+  webdav_sync: false
+
+# Default per-category soft-budget limits (CNY/month). Only drive
+# desktop notifications; never block inserts.
+budgets:
+  monthly:
+    餐饮: 2000
+    交通: 600
+    娱乐: 400

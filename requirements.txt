@@ -6,3 +6,7 @@ uvicorn[standard]>=0.27
 pydantic>=2.5
 pyperclip>=1.8
 pytest>=7.4
+httpx>=0.27
+PyYAML>=6.0
+# Optional, only required when features.sqlcipher is enabled:
+# pysqlcipher3
