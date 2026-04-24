@@ -59,12 +59,30 @@ features:
   extended_exporters: true
 
   # Native trigger bridge (watches an inbox dir populated by platform
-  # integrations: macOS Shortcuts / Windows PS / Android Tasker).
+  # integrations: macOS Shortcuts / Windows PS / Android Tasker / iOS
+  # Shortcuts via iCloud Drive).
   native_trigger:
     enabled: false
-    inbox_dir: ~/Library/Application Support/expense_tracker/inbox
+    inbox_dir: ~/Library/Mobile Documents/com~apple~CloudDocs/expense_inbox
     poll_interval: 1.0
     delete_after_process: true
+    # If a parsed payment passes the V1 confidence threshold, write it to
+    # the DB straight from the inbox; otherwise just notify the user
+    # (see desktop_popup) and let them confirm in the UI.
+    auto_confirm: true
+
+  # Static-token auth for write endpoints. Required once you bind
+  # uvicorn to 0.0.0.0 so the iPhone Shortcut can reach the Mac.
+  # Leave ``token`` empty: a random one is generated on first launch
+  # and stored at ~/.expense_tracker/.token (mode 0600).
+  auth:
+    enabled: false
+    token: ""
+    allow_localhost: true
+
+  # Pop a desktop notification when a native-triggered ingest needs
+  # user confirmation. Off by default so headless servers stay silent.
+  desktop_popup: false
 
   # SQLCipher-backed DB (key via EXPENSE_DB_KEY env var).
   sqlcipher: false

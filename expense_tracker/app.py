@@ -12,13 +12,14 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .classifier import Classifier
 from .db import DBManager, Transaction
 from .export import to_csv, weekly_summary
+from .modules import auth as auth_mod
 from .modules import config_loader
 from .parser import parse
 
@@ -115,12 +116,32 @@ _cmd_palette = _feat("command_palette")
 if _cmd_palette:
     from .modules.query import parse_query, execute as execute_query
 
+# ----- V2.3: auth + native_trigger wiring + desktop popup -----
+
+_auth_cfg = _cfg.get("features", {}).get("auth") or {}
+_intake_token = auth_mod.resolve_token(_auth_cfg, db.path)
+_allow_localhost = bool(_auth_cfg.get("allow_localhost", True))
+require_token = auth_mod.make_dependency(_intake_token, allow_localhost=_allow_localhost)
+_auth_deps = [Depends(require_token)] if _intake_token is not None else []
+
+_native_cfg = _cfg.get("features", {}).get("native_trigger") or {}
+_native_enabled = bool(_native_cfg.get("enabled"))
+_inbox_watcher = None
+_trigger_router = None
+
+_popup_enabled = bool(_feat("desktop_popup"))
+_popup_notifier = None
+if _popup_enabled:
+    from .modules.notifier import DesktopNotifier
+    _popup_notifier = DesktopNotifier()
+
 from contextlib import asynccontextmanager
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _digest_scheduler
+    global _digest_scheduler, _inbox_watcher, _trigger_router
+
     if _digest_enabled and _digest_notifier is not None:
         from .modules.daily_digest import DigestScheduler, run_digest_job
         raw_time = (_digest_cfg.get("time") or "22:00").strip()
@@ -133,11 +154,41 @@ async def _lifespan(app: FastAPI):
         )
         _digest_scheduler.start()
         print(f"[digest] scheduled daily at {hh:02d}:{mm:02d}")
+
+    if _native_enabled:
+        from .modules.native_trigger import InboxWatcher, TriggerRouter
+        inbox_dir = os.path.expanduser(
+            _native_cfg.get("inbox_dir") or str(db.path.parent / "inbox")
+        )
+        archive_dir = _native_cfg.get("archive_dir")
+        if archive_dir:
+            archive_dir = os.path.expanduser(archive_dir)
+        poll = float(_native_cfg.get("poll_interval", 1.0))
+        delete_after = bool(_native_cfg.get("delete_after_process", True))
+        auto_confirm = bool(_native_cfg.get("auto_confirm", True))
+
+        def _route(event):
+            _ingest_text(event.text, source=event.source, auto_confirm=auto_confirm)
+
+        _trigger_router = TriggerRouter(on_event=_route)
+        _trigger_router.start()
+        _inbox_watcher = InboxWatcher(
+            inbox_dir=inbox_dir, sink=_trigger_router.queue,
+            poll_interval=poll, delete_after_process=delete_after,
+            archive_dir=archive_dir,
+        )
+        _inbox_watcher.start()
+        print(f"[native] inbox watcher running on {inbox_dir} (poll {poll}s)")
+
     try:
         yield
     finally:
         if _digest_scheduler is not None:
             _digest_scheduler.stop()
+        if _inbox_watcher is not None:
+            _inbox_watcher.stop()
+        if _trigger_router is not None:
+            _trigger_router.stop()
 
 
 app = FastAPI(title="Expense Tracker", version="0.3.0", lifespan=_lifespan)
@@ -228,9 +279,12 @@ def index() -> FileResponse:
     return FileResponse(UI_DIR / "index.html")
 
 
-@app.post("/intake", response_model=IntakeResponse)
+@app.post("/intake", response_model=IntakeResponse, dependencies=_auth_deps)
 def intake(req: IntakeRequest) -> IntakeResponse:
-    text = req.text
+    return _parse_and_classify(req.text)
+
+
+def _parse_and_classify(text: str) -> IntakeResponse:
     parsed = parse(text)
     if not parsed.is_valid:
         raise HTTPException(status_code=422, detail=f"unparseable: {parsed.reason}")
@@ -287,7 +341,7 @@ def intake(req: IntakeRequest) -> IntakeResponse:
     )
 
 
-@app.post("/transactions")
+@app.post("/transactions", dependencies=_auth_deps)
 def create_transaction(tx_in: TransactionIn) -> dict:
     amount_base = tx_in.amount
     fx_attached = None
@@ -348,7 +402,7 @@ def list_transactions(limit: int = 200, since_days: Optional[int] = None) -> lis
     return db.list_transactions(limit=limit, since_days=since_days)
 
 
-@app.patch("/transactions/{tx_id}")
+@app.patch("/transactions/{tx_id}", dependencies=_auth_deps)
 def update_tx(tx_id: int, payload: CategoryUpdate) -> dict:
     if not db.update_category(tx_id, payload.category, payload.subcategory):
         raise HTTPException(status_code=404, detail="not found")
@@ -360,7 +414,7 @@ def update_tx(tx_id: int, payload: CategoryUpdate) -> dict:
     return {"id": tx_id, "status": "updated"}
 
 
-@app.delete("/transactions/{tx_id}")
+@app.delete("/transactions/{tx_id}", dependencies=_auth_deps)
 def delete_tx(tx_id: int) -> dict:
     if not db.soft_delete(tx_id):
         raise HTTPException(status_code=404, detail="not found")
@@ -386,7 +440,7 @@ def export_csv() -> PlainTextResponse:
 # --------------------------------------------------------------- V2 endpoints
 
 if _splits is not None:
-    @app.post("/transactions/{tx_id}/split")
+    @app.post("/transactions/{tx_id}/split", dependencies=_auth_deps)
     def split_tx(tx_id: int, payload: SplitIn) -> dict:
         try:
             parts = [SplitPart(amount=p.amount, category=p.category,
@@ -405,7 +459,7 @@ if _subs is not None:
 
 
 if _rules is not None:
-    @app.post("/rules/snapshot")
+    @app.post("/rules/snapshot", dependencies=_auth_deps)
     def snapshot_rules(note: Optional[str] = None) -> dict:
         path = _rules.snapshot(note=note)
         return {"path": str(path)}
@@ -443,7 +497,7 @@ if _alias is not None:
     def list_aliases() -> list[dict]:
         return _alias.list_all()
 
-    @app.post("/aliases")
+    @app.post("/aliases", dependencies=_auth_deps)
     def add_alias(payload: AliasIn) -> dict:
         if payload.merge_history:
             _alias.merge_history(payload.alias, payload.canonical)
@@ -451,7 +505,7 @@ if _alias is not None:
             _alias.add(payload.alias, payload.canonical)
         return {"status": "ok"}
 
-    @app.delete("/aliases/{alias}")
+    @app.delete("/aliases/{alias}", dependencies=_auth_deps)
     def delete_alias(alias: str) -> dict:
         if not _alias.remove(alias):
             raise HTTPException(status_code=404, detail="not found")
@@ -476,7 +530,7 @@ if _digest_enabled:
         title, body = _build_digest(db)
         return {"title": title, "body": body}
 
-    @app.post("/digest/test")
+    @app.post("/digest/test", dependencies=_auth_deps)
     def digest_test() -> dict:
         """Send the digest right now; useful to confirm the Server Chan key."""
         ok = _run_digest(db, _digest_notifier)
@@ -494,14 +548,14 @@ class ReconcileImportIn(BaseModel):
 
 
 if _reconcile_enabled:
-    @app.post("/reconcile")
+    @app.post("/reconcile", dependencies=_auth_deps)
     def reconcile_endpoint(req: ReconcileIn) -> dict:
         entries = parse_statement(req.text, channel=req.channel)
         rows = db.list_transactions(limit=100_000)
         report = reconcile(rows, entries)
         return report.to_dict()
 
-    @app.post("/reconcile/import")
+    @app.post("/reconcile/import", dependencies=_auth_deps)
     def reconcile_import_endpoint(req: ReconcileImportIn) -> dict:
         result = reconcile_bulk_import(db, req.entries, default_account=req.default_account)
         return result
@@ -531,4 +585,67 @@ def get_features() -> dict:
         "daily_digest": _digest_enabled,
         "reconcile": _reconcile_enabled,
         "command_palette": _cmd_palette,
+        "auth": _intake_token is not None,
+        "native_trigger": _native_enabled,
+        "desktop_popup": _popup_enabled,
+    }
+
+
+# --------------------------------------------------------------- ingest helper
+
+def _ingest_text(text: str, source: str = "native",
+                 auto_confirm: bool = True) -> dict:
+    """Parse + classify ``text`` and -- if confidence is high enough --
+    persist it. Used by the InboxWatcher native-trigger callback.
+
+    Returns ``{"status": "...", "id": int|None, "preview": IntakeResponse}``.
+    Failures are swallowed-with-log instead of raising so the inbox
+    poller doesn't crash on a single bad payload.
+    """
+    try:
+        preview = _parse_and_classify(text)
+    except HTTPException as exc:
+        print(f"[ingest] unparseable from {source}: {exc.detail}")
+        return {"status": "skipped", "id": None, "preview": None}
+
+    new_id: Optional[int] = None
+    if auto_confirm and not preview.needs_confirmation and preview.candidates:
+        top = preview.candidates[0]
+        try:
+            tx_in = TransactionIn(
+                amount=preview.amount or 0.0,
+                direction=preview.direction,
+                merchant=preview.merchant,
+                account=preview.account,
+                category=top.category,
+                subcategory=top.subcategory,
+                occurred_at=preview.occurred_at,
+                raw_text=preview.raw_text,
+                confidence=preview.confidence,
+                source=source,
+            )
+            result = create_transaction(tx_in)
+            new_id = result.get("id")
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                # Dedup hit -- treat as success-ish so retries don't pile up.
+                return {"status": "duplicate", "id": None, "preview": preview.model_dump()}
+            print(f"[ingest] auto-create failed: {exc.detail}")
+
+    if _popup_notifier is not None:
+        cands = preview.candidates[:3] if preview.candidates else []
+        bullets = "\n".join(
+            f"{i+1}. {c.category}{'/' + c.subcategory if c.subcategory else ''} ({int(c.confidence*100)}%)"
+            for i, c in enumerate(cands)
+        ) or "(no candidates)"
+        title = f"待确认: {preview.merchant or '?'} ¥{preview.amount or 0:.2f}"
+        try:
+            _popup_notifier.send(title, bullets)
+        except Exception as exc:  # pragma: no cover
+            print(f"[ingest] popup failed: {exc}")
+
+    return {
+        "status": "auto_confirmed" if new_id else "needs_confirm",
+        "id": new_id,
+        "preview": preview.model_dump(),
     }

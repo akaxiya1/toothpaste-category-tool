@@ -297,4 +297,36 @@ parser 通过 `+/-`、`退款 / 到账 / 转入 / 转出` 等关键词推断；�
 
 ---
 
+## V2.3 增量（自动记账：iPhone 通知 → 直接落库）
+
+终于让"复制 / 粘贴"消失。三件事：
+1. **静态 Token 鉴权** (`modules/auth.py`) —— 让 uvicorn 安全绑到 `0.0.0.0`，iPhone 才连得上 Mac
+2. **激活 InboxWatcher** —— 把已经写好但没接的"原生触发桥"接到 lifespan：iCloud Drive 文件 / 同 Wi-Fi POST 都会自动入库
+3. **iOS Shortcut 配方文档** —— `expense_tracker/docs/ios_shortcut.md`
+
+| 文件 | 改动 | 说明 |
+| --- | --- | --- |
+| `modules/auth.py` (新) | 新增 | Token 解析、生成、`X-Intake-Token` 依赖 |
+| `app.py` | 改 | 抽出 `_parse_and_classify` + `_ingest_text`；lifespan 启动 `InboxWatcher` + `TriggerRouter`；为所有写端点加 `dependencies=_auth_deps`；可选桌面通知 |
+| `config.yaml` | 改 | 新增 `auth` / `native_trigger.auto_confirm` / `desktop_popup` |
+| `docs/ios_shortcut.md` (新) | 新增 | 一次配置 10 分钟的图文步骤 |
+| `tests/test_modules_auth.py` (新) | 新增 | Token 生成、磁盘持久化、依赖鉴权、本机豁免 |
+| `tests/test_inbox_ingest_e2e.py` (新) | 新增 | InboxWatcher 端到端：丢 JSON → 自动落库 + dedup 拦截重复 |
+
+### 怎么用（每天）
+- 主力**iPhone 已开 Pushcut + Shortcut**：付款 → 通知到 → 自动 POST → Mac 桌面弹"待确认 ¥15 瑞幸咖啡" → 按 Enter 或 1/2/3 → 落库。
+- 临时**没装 Pushcut**：通知栏长按账单 → "拷贝" → 锁屏点"一键记账"图标 → 完成。
+- **不在家**：Shortcut 自动改写 `iCloud Drive/expense_inbox/*.json` → 回家 Mac 同步 → InboxWatcher 1 秒内消费。
+
+完整步骤见 [`expense_tracker/docs/ios_shortcut.md`](expense_tracker/docs/ios_shortcut.md)。
+
+### 安全说明（一句话）
+- 同 Wi-Fi 的人没 Token 发不进来（`X-Intake-Token` 比对，`secrets.compare_digest`）
+- 本机 UI 仍然零 Token（`allow_localhost: true` 默认豁免 127.0.0.1）
+- Token 存 `~/.expense_tracker/.token`（mode 0600），不写日志
+
+V2.3 测试合计 **110 个用例通过**。
+
+---
+
 如需在本仓库继续迭代，开发分支为 `claude/expense-tracker-clipboard-nyc9M`。
