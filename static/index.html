@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>牙膏类目本地选品与定价工具</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">LOCAL CATEGORY WORKBENCH</p>
+          <h1>牙膏类目本地选品与定价工具</h1>
+          <p class="hero-copy">
+            只在本机运行，集中管理门店现有牙膏 SKU、候选新品、结构分析、市场快照、定价建议和本地备份。
+          </p>
+        </div>
+        <div class="hero-panel">
+          <div class="hero-chip">127.0.0.1 本地运行</div>
+          <div class="hero-chip">SQLite 本机存储</div>
+          <div class="hero-chip">支持 Excel / CSV</div>
+          <div class="hero-chip">离线可用</div>
+          <div class="db-path" id="dbPath"></div>
+        </div>
+      </header>
+
+      <section class="summary-grid" id="summaryGrid"></section>
+
+      <nav class="module-nav" id="moduleNav">
+        <button class="nav-btn active" data-target="importModule">数据导入</button>
+        <button class="nav-btn" data-target="skuModule">现有SKU库</button>
+        <button class="nav-btn" data-target="candidateModule">候选新品库</button>
+        <button class="nav-btn" data-target="comparisonModule">单品对比</button>
+        <button class="nav-btn" data-target="dashboardModule">类目看板</button>
+        <button class="nav-btn" data-target="recommendationModule">定价与建议</button>
+      </nav>
+
+      <main>
+        <section class="module active" id="importModule">
+          <div class="module-header">
+            <div>
+              <h2>数据导入</h2>
+              <p>导入门店现有牙膏 SKU 或候选新品，先预览字段映射，再正式入库。</p>
+            </div>
+            <div class="template-links" id="templateLinks"></div>
+          </div>
+          <div class="two-column">
+            <form class="card stack" id="importForm">
+              <label>
+                <span>导入类型</span>
+                <select name="kind" id="importKind">
+                  <option value="sku">门店现有SKU</option>
+                  <option value="candidate">候选新品</option>
+                </select>
+              </label>
+              <label>
+                <span>选择文件</span>
+                <input type="file" name="file" id="importFile" accept=".csv,.xlsx" />
+              </label>
+              <button type="submit" class="primary-btn">预览导入内容</button>
+              <p class="muted">建议优先使用模板列名。预览后可手动调整字段映射，再执行正式导入。</p>
+            </form>
+
+            <div class="card stack">
+              <h3>导入说明</h3>
+              <ul class="plain-list">
+                <li>现有 SKU 导入后会自动计算毛利率、单件毛利额、单克售价和价格带。</li>
+                <li>候选新品支持半自动录入，可保留来源平台、链接、热度和差异化卖点。</li>
+                <li>同一条码会提示重复，正式导入时按最新数据覆盖更新。</li>
+                <li>同名高相似商品会提示疑似重复，方便你确认是否已经在售。</li>
+              </ul>
+            </div>
+          </div>
+          <div id="importPreview"></div>
+        </section>
+
+        <section class="module" id="skuModule">
+          <div class="module-header">
+            <div>
+              <h2>现有 SKU 库</h2>
+              <p>快速查看品牌、功效、价格带、市场锚点和结构动作建议。</p>
+            </div>
+          </div>
+          <div class="card stack">
+            <div class="filter-grid">
+              <label>
+                <span>搜索</span>
+                <input type="search" id="skuSearch" placeholder="品牌 / 名称 / SKU编码" />
+              </label>
+              <label>
+                <span>品牌</span>
+                <select id="skuBrandFilter"></select>
+              </label>
+              <label>
+                <span>功效</span>
+                <select id="skuEfficacyFilter"></select>
+              </label>
+              <label>
+                <span>价格带</span>
+                <select id="skuPriceBandFilter"></select>
+              </label>
+              <label>
+                <span>建议动作</span>
+                <select id="skuActionFilter">
+                  <option value="">全部</option>
+                  <option value="建议低价引流">建议低价引流</option>
+                  <option value="建议调整售价">建议调整售价</option>
+                  <option value="建议利润定价">建议利润定价</option>
+                  <option value="建议下架">建议下架</option>
+                  <option value="建议维持常规价">建议维持常规价</option>
+                </select>
+              </label>
+            </div>
+            <div class="table-wrap">
+              <table id="skuTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="module" id="candidateModule">
+          <div class="module-header">
+            <div>
+              <h2>候选新品库</h2>
+              <p>录入线上热销但门店还没上的牙膏，系统会自动匹配最接近的在售 SKU 并生成建议。</p>
+            </div>
+          </div>
+          <div class="card stack crawl-card">
+            <div class="inline-actions">
+              <div>
+                <h3>热销抓取器</h3>
+                <p class="muted">默认抓取京东、天猫、小红书、淘宝，会自动扩展多关键词并对连续出现的商品加权。即使不勾选平台，也会自动回退到默认平台集合。</p>
+              </div>
+            </div>
+            <div class="filter-grid">
+              <label>
+                <span>搜索关键词</span>
+                <input type="text" id="crawlKeyword" value="牙膏" />
+              </label>
+              <label>
+                <span>每个平台抓取数</span>
+                <select id="crawlLimit">
+                  <option value="10">10</option>
+                  <option value="20" selected>20</option>
+                  <option value="30">30</option>
+                  <option value="40">40</option>
+                </select>
+              </label>
+              <div class="crawl-platforms" id="crawlPlatforms"></div>
+            </div>
+            <details class="crawl-details">
+              <summary>高级设置：平台 Cookie（按需补充）</summary>
+              <p class="muted" id="cookieNotice">
+                Cookie 是你浏览器当前登录态，只在本机当前请求中使用，不会写入数据库，也不会进入备份。只有平台拦截时再补对应 Cookie 就可以。
+              </p>
+              <div class="filter-grid compact">
+                <label>
+                  <span>京东 Cookie</span>
+                  <textarea id="cookieJd" rows="3" placeholder="pt_key=...; pt_pin=..."></textarea>
+                </label>
+                <label>
+                  <span>天猫 Cookie</span>
+                  <textarea id="cookieTmall" rows="3" placeholder="x5sec=...; cookie2=..."></textarea>
+                </label>
+                <label>
+                  <span>小红书 Cookie</span>
+                  <textarea id="cookieXiaohongshu" rows="3" placeholder="a1=...; webId=..."></textarea>
+                </label>
+                <label>
+                  <span>淘宝 Cookie</span>
+                  <textarea id="cookieTaobao" rows="3" placeholder="_m_h5_tk=...; cookie2=..."></textarea>
+                </label>
+              </div>
+            </details>
+            <div class="inline-actions">
+              <button type="button" class="primary-btn" id="crawlBtn">一键抓取热销牙膏</button>
+              <div class="muted" id="crawlStatus">抓取会用慢速串行方式执行，尽量降低平台风控概率。</div>
+            </div>
+            <div id="crawlPreview"></div>
+          </div>
+          <div class="two-column helper-grid">
+            <article class="card stack helper-card">
+              <div>
+                <h3>浏览器辅助采集</h3>
+                <p class="muted" id="browserHelperNotice">当 Cookie 兜底仍然失败时，先在目标平台页面运行辅助脚本，再把脚本输出粘贴回这里导入。</p>
+              </div>
+              <div class="filter-grid compact">
+                <label>
+                  <span>目标平台</span>
+                  <select id="browserCapturePlatform"></select>
+                </label>
+                <label>
+                  <span>来源页面链接（可选）</span>
+                  <input type="url" id="browserCaptureSourceUrl" placeholder="https://..." />
+                </label>
+              </div>
+              <div class="inline-actions">
+                <button type="button" class="ghost-btn" id="copyBrowserScriptBtn">复制辅助脚本</button>
+                <span class="muted" id="browserCaptureStatus">1. 打开平台搜索页 2. 在控制台运行脚本 3. 把 JSON 粘贴回下面</span>
+              </div>
+              <label>
+                <span>浏览器辅助采集结果（JSON）</span>
+                <textarea id="browserCaptureInput" rows="10" placeholder='把辅助脚本输出的 JSON 粘贴到这里'></textarea>
+              </label>
+              <div class="inline-actions">
+                <button type="button" class="primary-btn" id="importBrowserCaptureBtn">导入浏览器采集结果</button>
+              </div>
+            </article>
+            <article class="card stack helper-card">
+              <div>
+                <h3>批量粘贴采集</h3>
+                <p class="muted">如果连浏览器辅助采集都不方便，就把商品标题、价格、销量文本、链接整段粘贴进来，系统会尽量帮你整理成候选池。</p>
+              </div>
+              <div class="filter-grid compact">
+                <label>
+                  <span>来源平台</span>
+                  <select id="pasteCapturePlatform"></select>
+                </label>
+                <label>
+                  <span>关键词（可选）</span>
+                  <input type="text" id="pasteCaptureKeyword" value="牙膏" />
+                </label>
+              </div>
+              <label>
+                <span>批量粘贴内容</span>
+                <textarea id="pasteCaptureInput" rows="10" placeholder="支持多行商品卡片文本、标题+价格+链接、或 JSON 列表"></textarea>
+              </label>
+              <div class="inline-actions">
+                <button type="button" class="primary-btn" id="importPasteCaptureBtn">解析并导入</button>
+                <span class="muted" id="pasteCaptureStatus">至少保留商品名和价格，链接和销量文本有则更好。</span>
+              </div>
+            </article>
+          </div>
+          <div class="two-column candidate-layout">
+            <form class="card stack" id="candidateForm">
+              <input type="hidden" id="candidateId" />
+              <div class="filter-grid compact">
+                <label>
+                  <span>品牌</span>
+                  <input type="text" id="candidateBrand" required />
+                </label>
+                <label>
+                  <span>商品名称</span>
+                  <input type="text" id="candidateName" required />
+                </label>
+                <label>
+                  <span>规格净含量</span>
+                  <input type="text" id="candidateSpec" placeholder="如：120g / 140g*2" required />
+                </label>
+                <label>
+                  <span>功效标签</span>
+                  <select id="candidateEfficacy"></select>
+                </label>
+                <label>
+                  <span>线上参考价</span>
+                  <input type="number" id="candidateOnlinePrice" min="0" step="0.01" required />
+                </label>
+                <label>
+                  <span>预计进价</span>
+                  <input type="number" id="candidateCost" min="0" step="0.01" required />
+                </label>
+                <label>
+                  <span>来源平台</span>
+                  <select id="candidatePlatform"></select>
+                </label>
+                <label>
+                  <span>热度分</span>
+                  <input type="number" id="candidateHeat" min="0" max="100" step="1" placeholder="0-100" />
+                </label>
+                <label>
+                  <span>适用人群</span>
+                  <select id="candidateTargetGroup"></select>
+                </label>
+                <label>
+                  <span>活动属性</span>
+                  <select id="candidatePromoType"></select>
+                </label>
+                <label>
+                  <span>商品链接</span>
+                  <input type="url" id="candidateUrl" placeholder="https://..." />
+                </label>
+                <label>
+                  <span>拟替代SKU</span>
+                  <input type="text" id="candidateReplaceSku" />
+                </label>
+                <label>
+                  <span>是否含氟</span>
+                  <select id="candidateFluoride">
+                    <option value="0">否</option>
+                    <option value="1">是</option>
+                  </select>
+                </label>
+                <label>
+                  <span>是否门店必保留基础款</span>
+                  <select id="candidateMustKeep">
+                    <option value="0">否</option>
+                    <option value="1">是</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                <span>差异化卖点</span>
+                <textarea id="candidateDifferentiation" rows="3"></textarea>
+              </label>
+              <label>
+                <span>替代关系</span>
+                <textarea id="candidateSubstituteRelation" rows="2"></textarea>
+              </label>
+              <label>
+                <span>备注</span>
+                <textarea id="candidateNotes" rows="2"></textarea>
+              </label>
+              <div class="inline-actions">
+                <button type="submit" class="primary-btn" id="candidateSubmitBtn">保存候选新品</button>
+                <button type="button" class="ghost-btn" id="candidateResetBtn">清空表单</button>
+              </div>
+            </form>
+
+            <div class="card stack">
+              <h3>候选新品清单</h3>
+              <div class="table-wrap">
+                <table id="candidateTable">
+                  <thead></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="module" id="comparisonModule">
+          <div class="module-header">
+            <div>
+              <h2>单品对比</h2>
+              <p>自动匹配候选新品最接近的 3 个在售 SKU，对比价格、毛利、销量和系统分层。</p>
+            </div>
+            <label class="inline-select">
+              <span>选择候选新品</span>
+              <select id="comparisonSelector"></select>
+            </label>
+          </div>
+          <div id="comparisonPanel"></div>
+        </section>
+
+        <section class="module" id="dashboardModule">
+          <div class="module-header">
+            <div>
+              <h2>类目看板</h2>
+              <p>点击价格带可展开该价格带下的全部商品，并直接改价预览毛利率与建议动作。</p>
+            </div>
+          </div>
+          <div id="dashboardPanel"></div>
+        </section>
+
+        <section class="module" id="recommendationModule">
+          <div class="module-header">
+            <div>
+              <h2>定价与建议</h2>
+              <p>先看最关键的定价动作，再按需展开市场样本、为什么这么建议和批量调价模拟，避免信息一下子堆太满。</p>
+            </div>
+            <div class="inline-actions">
+              <button class="ghost-btn" id="marketRefreshBtn">刷新市场快照</button>
+              <button class="primary-btn" id="backupBtn">生成本地备份</button>
+            </div>
+          </div>
+          <div class="feedback-banner" id="marketRefreshFeedback"></div>
+          <div class="feedback-banner" id="backupFeedback"></div>
+          <div id="autoSelectionPanel"></div>
+          <div class="stack">
+            <div id="pricingFocusPanel"></div>
+            <div class="card stack">
+              <div class="inline-actions">
+                <div>
+                  <h3>现有 SKU 建议</h3>
+                  <p class="muted">默认先看关键定价字段。需要时再展开每行详情，查看样本质量和系统依据。</p>
+                </div>
+              </div>
+              <div id="marketDiagnosticsPanel"></div>
+              <div class="table-wrap">
+                <table id="skuRecommendationTable">
+                  <thead></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+            <div id="pricingSimulatorPanel"></div>
+            <div class="card stack">
+              <h3>候选新品建议</h3>
+              <div class="table-wrap">
+                <table id="candidateRecommendationTable">
+                  <thead></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
