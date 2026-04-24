@@ -114,6 +114,19 @@
       <div id="aliasList" class="text-sm space-y-1"></div>
     </div>
 
+    <div id="reconcileSection" class="hidden">
+      <h3 class="font-medium mb-2">对账校验</h3>
+      <p class="text-xs text-slate-500 mb-2">粘贴微信/支付宝导出的 CSV，高亮漏记 / 重复 / 金额不符。不会自动落库，由你勾选导入。</p>
+      <textarea id="reconcileCsv" rows="4" class="w-full border rounded p-1.5 text-xs font-mono"
+        placeholder="粘贴 CSV 全文（含头部元信息也可以）"></textarea>
+      <div class="flex gap-2 mt-2">
+        <button id="reconcileRun" class="bg-blue-600 text-white px-3 py-1.5 rounded text-sm">解析对账</button>
+        <button id="reconcileImport" class="bg-emerald-600 text-white px-3 py-1.5 rounded text-sm hidden">导入勾选</button>
+        <span id="reconcileStats" class="text-xs text-slate-500 self-center"></span>
+      </div>
+      <div id="reconcileOut" class="mt-2 space-y-2 text-sm"></div>
+    </div>
+
     <div>
       <h3 class="font-medium mb-2">每日总结</h3>
       <p class="text-xs text-slate-500 mb-2">在 <code>config.yaml</code> 打开后，这里可以预览今天的总结文案，或立刻推送一次测试。</p>
@@ -123,6 +136,19 @@
       </div>
       <pre id="digestOut" class="mt-2 text-xs whitespace-pre-wrap bg-slate-50 border rounded p-2 hidden"></pre>
     </div>
+  </div>
+</div>
+
+<!-- Command palette (Ctrl+K / Cmd+K) -->
+<div id="cmdPalette" class="fixed inset-0 bg-black/40 hidden z-20" role="dialog">
+  <div class="max-w-xl mx-auto mt-20 bg-white rounded-xl shadow-xl overflow-hidden">
+    <div class="p-3 border-b flex items-center gap-2">
+      <input id="cmdInput" class="flex-1 outline-none text-sm" autocomplete="off"
+        placeholder="例：上周咖啡 超过50  /  本月 打车  /  瑞幸 >100  /  2026-04 京东" />
+      <span class="text-xs text-slate-400">Esc 关闭</span>
+    </div>
+    <div id="cmdSummary" class="px-3 py-2 text-xs bg-slate-50 text-slate-600 border-b hidden"></div>
+    <ul id="cmdResults" class="max-h-96 overflow-y-auto divide-y text-sm"></ul>
   </div>
 </div>
 
@@ -351,6 +377,116 @@ async function loadAliases() {
   });
 }
 
+// ---------- Reconcile ----------
+let reconcileReport = null;
+
+async function runReconcile() {
+  const text = $("reconcileCsv").value.trim();
+  if (!text) return;
+  $("reconcileStats").textContent = "解析中...";
+  const r = await fetch("/reconcile", { method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
+  if (!r.ok) { $("reconcileStats").textContent = "失败"; return; }
+  reconcileReport = await r.json();
+  renderReconcile();
+}
+
+function renderReconcile() {
+  if (!reconcileReport) return;
+  const s = reconcileReport.stats;
+  $("reconcileStats").textContent =
+    `已解析 ${s.total_statement_entries} 条 · 匹配 ${s.matched} · 漏记 ${s.missing_in_db} · 金额不符 ${s.amount_mismatch} · DB 多 ${s.missing_in_statement}`;
+  const out = $("reconcileOut");
+  out.innerHTML = "";
+  if (reconcileReport.missing_in_db.length) {
+    const rows = reconcileReport.missing_in_db.map((e, i) => `
+      <tr class="border-b">
+        <td class="p-1"><input type="checkbox" class="missing-chk" data-idx="${i}" checked /></td>
+        <td class="p-1 text-slate-500">${e.occurred_at.replace("T", " ")}</td>
+        <td class="p-1">${e.merchant || "-"}</td>
+        <td class="p-1 text-right font-mono">${e.direction === "expense" ? "-" : "+"}¥${e.amount.toFixed(2)}</td>
+      </tr>`).join("");
+    out.insertAdjacentHTML("beforeend", `
+      <div>
+        <div class="font-medium text-rose-600">漏记 (${reconcileReport.missing_in_db.length})</div>
+        <table class="w-full text-xs"><tbody>${rows}</tbody></table>
+      </div>`);
+    $("reconcileImport").classList.remove("hidden");
+  }
+  if (reconcileReport.amount_mismatch.length) {
+    const rows = reconcileReport.amount_mismatch.map(m => `
+      <li>${m.entry.occurred_at.replace("T"," ")} · ${m.entry.merchant || "-"} ·
+          账单 ¥${m.entry.amount.toFixed(2)} vs 本地 ¥${Number(m.db_row.amount).toFixed(2)} (Δ ${m.delta})</li>`).join("");
+    out.insertAdjacentHTML("beforeend", `
+      <div><div class="font-medium text-amber-600">金额不符 (${reconcileReport.amount_mismatch.length})</div>
+           <ul class="list-disc pl-4 text-xs text-slate-700">${rows}</ul></div>`);
+  }
+  if (reconcileReport.missing_in_statement.length) {
+    out.insertAdjacentHTML("beforeend", `
+      <div class="text-xs text-slate-500">本地存在但账单中没有：${reconcileReport.missing_in_statement.length} 条（可能是现金或手动录入）</div>`);
+  }
+}
+
+async function importMissing() {
+  if (!reconcileReport) return;
+  const picks = [...document.querySelectorAll(".missing-chk")]
+    .filter(c => c.checked)
+    .map(c => reconcileReport.missing_in_db[parseInt(c.dataset.idx)]);
+  if (!picks.length) return;
+  const r = await fetch("/reconcile/import", { method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({entries: picks})});
+  const j = await r.json();
+  alert(`已导入 ${j.created.length} 条，重复跳过 ${j.duplicates.length} 条`);
+  reconcileReport = null;
+  $("reconcileOut").innerHTML = "";
+  $("reconcileCsv").value = "";
+  $("reconcileImport").classList.add("hidden");
+  $("reconcileStats").textContent = "";
+  refresh();
+}
+
+// ---------- Command palette ----------
+let cmdDebounce = null;
+
+function openCmd() {
+  if (!features.command_palette) return;
+  $("cmdPalette").classList.remove("hidden");
+  $("cmdInput").value = "";
+  $("cmdResults").innerHTML = "";
+  $("cmdSummary").classList.add("hidden");
+  $("cmdInput").focus();
+}
+
+function closeCmd() {
+  $("cmdPalette").classList.add("hidden");
+}
+
+async function runCmdSearch() {
+  const q = $("cmdInput").value.trim();
+  if (!q) { $("cmdResults").innerHTML = ""; $("cmdSummary").classList.add("hidden"); return; }
+  const r = await fetch("/search?q=" + encodeURIComponent(q) + "&limit=50");
+  if (!r.ok) return;
+  const j = await r.json();
+  const filters = j.filter || {};
+  const chips = Object.entries(filters).filter(([k,v]) => k !== "raw" && v !== "" && !(Array.isArray(v) && v.length === 0))
+    .map(([k,v]) => `<span class="mr-2">${k}: <b>${Array.isArray(v) ? v.join(" ") : v}</b></span>`).join("");
+  $("cmdSummary").innerHTML = `${j.total_count} 笔 · 合计 <b>¥${j.total_amount.toFixed(2)}</b>${chips ? ' · ' + chips : ''}`;
+  $("cmdSummary").classList.remove("hidden");
+  $("cmdResults").innerHTML = j.rows.map(t => {
+    const sign = t.direction === "expense" ? "-" : "+";
+    const cls = t.direction === "expense" ? "text-rose-600" : "text-emerald-600";
+    return `<li class="px-3 py-2 hover:bg-slate-50">
+      <div class="flex justify-between items-center">
+        <div>
+          <div class="font-medium">${t.merchant || "(未知)"} <span class="text-xs text-slate-400 ml-1">${t.category || ""}${t.subcategory ? '/' + t.subcategory : ''}</span></div>
+          <div class="text-xs text-slate-500">${(t.occurred_at || "").replace("T"," ")} · ${t.account || ""}</div>
+        </div>
+        <div class="${cls} font-mono">${sign}¥${Number(t.amount).toFixed(2)}</div>
+      </div></li>`;
+  }).join("") || "<li class='px-3 py-4 text-slate-400 text-center'>无匹配</li>";
+}
+
 $("parseBtn").onclick = parseText;
 $("confirmBtn").onclick = confirm;
 $("cancelBtn").onclick = reset;
@@ -361,8 +497,18 @@ $("pasteBtn").onclick = async () => {
   catch { $("hint").textContent = "浏览器拒绝读取剪贴板，请手动粘贴"; }
 };
 
-$("settingsBtn").onclick = () => { $("settings").classList.remove("hidden"); loadAliases(); };
+$("settingsBtn").onclick = () => {
+  $("settings").classList.remove("hidden"); loadAliases();
+  if (features.reconcile) $("reconcileSection").classList.remove("hidden");
+};
 $("settingsClose").onclick = () => $("settings").classList.add("hidden");
+$("reconcileRun").onclick = runReconcile;
+$("reconcileImport").onclick = importMissing;
+$("cmdInput") && ($("cmdInput").oninput = () => {
+  clearTimeout(cmdDebounce);
+  cmdDebounce = setTimeout(runCmdSearch, 180);
+});
+$("cmdPalette") && ($("cmdPalette").onclick = (e) => { if (e.target.id === "cmdPalette") closeCmd(); });
 $("aliasAdd").onclick = async () => {
   const a = $("aliasFrom").value.trim(), c = $("aliasTo").value.trim();
   if (!a || !c) return;
@@ -386,6 +532,17 @@ $("digestTest").onclick = async () => {
 };
 
 document.addEventListener("keydown", (e) => {
+  // Ctrl/Cmd+K → command palette (global)
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    if ($("cmdPalette").classList.contains("hidden")) openCmd(); else closeCmd();
+    return;
+  }
+  // If command palette is open, Esc closes it
+  if (!$("cmdPalette").classList.contains("hidden")) {
+    if (e.key === "Escape") { e.preventDefault(); closeCmd(); }
+    return;
+  }
   if (e.ctrlKey && e.key.toLowerCase() === "z" && lastInsertId) { e.preventDefault(); undoLast(); return; }
   if (!preview) {
     if (e.key === "Enter" && e.target.id === "raw") { e.preventDefault(); parseText(); }

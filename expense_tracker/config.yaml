@@ -17,6 +17,12 @@ features:
   # never blocks inserts.
   budget_alerts: true
 
+  # Monthly reconciliation against WeChat / Alipay CSV.
+  reconcile: true
+
+  # Ctrl+K command palette with natural-language query parser.
+  command_palette: true
+
   # Daily 22:00 digest (default). Set ``notifier: wechat`` + plug in a
   # Server Chan SENDKEY for personal WeChat push.
   daily_digest:

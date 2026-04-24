@@ -107,6 +107,14 @@ if _digest_enabled:
 
 BUDGETS_MONTHLY = (_cfg.get("budgets") or {}).get("monthly") or {}
 
+_reconcile_enabled = _feat("reconcile")
+if _reconcile_enabled:
+    from .modules.reconcile import parse_statement, reconcile, bulk_import as reconcile_bulk_import
+
+_cmd_palette = _feat("command_palette")
+if _cmd_palette:
+    from .modules.query import parse_query, execute as execute_query
+
 from contextlib import asynccontextmanager
 
 
@@ -475,6 +483,37 @@ if _digest_enabled:
         return {"sent": ok}
 
 
+class ReconcileIn(BaseModel):
+    text: str
+    channel: Optional[str] = None
+
+
+class ReconcileImportIn(BaseModel):
+    entries: list[dict]
+    default_account: Optional[str] = None
+
+
+if _reconcile_enabled:
+    @app.post("/reconcile")
+    def reconcile_endpoint(req: ReconcileIn) -> dict:
+        entries = parse_statement(req.text, channel=req.channel)
+        rows = db.list_transactions(limit=100_000)
+        report = reconcile(rows, entries)
+        return report.to_dict()
+
+    @app.post("/reconcile/import")
+    def reconcile_import_endpoint(req: ReconcileImportIn) -> dict:
+        result = reconcile_bulk_import(db, req.entries, default_account=req.default_account)
+        return result
+
+
+if _cmd_palette:
+    @app.get("/search")
+    def search_endpoint(q: str = "", limit: int = 50) -> dict:
+        filt = parse_query(db, q)
+        return execute_query(db, filt, limit=limit).to_dict()
+
+
 @app.get("/features")
 def get_features() -> dict:
     """Expose enabled features so the UI can show/hide sections."""
@@ -490,4 +529,6 @@ def get_features() -> dict:
         "merchant_alias": _alias is not None,
         "budget_alerts": _budget_alerts,
         "daily_digest": _digest_enabled,
+        "reconcile": _reconcile_enabled,
+        "command_palette": _cmd_palette,
     }
