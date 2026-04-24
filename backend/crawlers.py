@@ -25,6 +25,12 @@ PLATFORM_LABELS = {
 
 DEFAULT_PLATFORMS = ["jd", "tmall", "xiaohongshu", "taobao"]
 MARKET_SNAPSHOT_PLATFORMS = ["jd", "tmall", "taobao", "xiaohongshu"]
+PRICE_REFERENCE_PLATFORM_WEIGHTS = {
+    "taobao": 0.34,
+    "tmall": 0.33,
+    "jd": 0.33,
+}
+PRICE_REFERENCE_PLATFORMS = ["taobao", "tmall", "jd"]
 DEFAULT_HOT_KEYWORDS = ["牙膏", "美白牙膏", "抗敏牙膏", "儿童牙膏", "草本牙膏", "口气清新牙膏"]
 
 KNOWN_BRANDS = [
@@ -1340,6 +1346,10 @@ def _filter_relevant_market_items(items: list[RawHotItem], sku: dict[str, Any], 
     return {
         "items": selected[:target_count],
         "quality": quality,
+        "strict_count": sum(1 for row in selected_scored if row["strict"]),
+        "medium_count": sum(1 for row in selected_scored if row["medium"]),
+        "loose_count": sum(1 for row in selected_scored if row["loose"]),
+        "selected_count": len(selected_scored),
     }
 
 
@@ -1367,7 +1377,7 @@ def _summarize_price_samples(prices: list[float]) -> tuple[float, float, float, 
     mean_price = sum(cleaned) / len(cleaned)
     variance = sum((price - mean_price) ** 2 for price in cleaned) / len(cleaned)
     cv = math.sqrt(variance) / mean_price if mean_price else 0
-    disorder_flag = 1 if ratio >= 1.5 or cv >= 0.22 else 0
+    disorder_flag = 1 if ratio >= 1.5 or cv >= 0.18 else 0
     return avg_price, min_price, max_price, len(cleaned), disorder_flag
 
 
@@ -1385,3 +1395,646 @@ def _combine_platform_heat(platform_scores: list[float]) -> float:
     average = sum(platform_scores) / len(platform_scores)
     bonus = min(8.0, max(0, len(platform_scores) - 1) * 2.0)
     return min(100.0, best * 0.6 + average * 0.4 + bonus)
+
+
+def _percentile_from_sorted(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return round(values[0], 2)
+    index = max(0.0, min(percentile, 1.0)) * (len(values) - 1)
+    lower = int(math.floor(index))
+    upper = int(math.ceil(index))
+    if lower == upper:
+        return round(values[lower], 2)
+    weight = index - lower
+    return round(values[lower] + (values[upper] - values[lower]) * weight, 2)
+
+
+def _median_from_sorted(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    middle = len(values) // 2
+    if len(values) % 2:
+        return round(values[middle], 2)
+    return round((values[middle - 1] + values[middle]) / 2, 2)
+
+
+def _summarize_source_prices(prices: list[float]) -> dict[str, Any]:
+    cleaned = sorted(price for price in prices if price > 0)
+    if not cleaned:
+        return {
+            "sample_count": 0,
+            "trimmed_mean_price": 0.0,
+            "median_price": 0.0,
+            "p10_price": 0.0,
+            "p90_price": 0.0,
+            "min_price": 0.0,
+            "max_price": 0.0,
+            "price_disorder_flag": 0,
+        }
+    trimmed = cleaned[:]
+    if len(trimmed) >= 5:
+        trim_count = max(1, int(len(trimmed) * 0.1))
+        trimmed = trimmed[trim_count:-trim_count] or cleaned
+    avg_price, min_price, max_price, sample_count, disorder_flag = _summarize_price_samples(cleaned)
+    return {
+        "sample_count": sample_count,
+        "trimmed_mean_price": round(sum(trimmed) / len(trimmed), 2),
+        "median_price": _median_from_sorted(cleaned),
+        "p10_price": _percentile_from_sorted(cleaned, 0.10),
+        "p90_price": _percentile_from_sorted(cleaned, 0.90),
+        "min_price": min_price,
+        "max_price": max_price,
+        "price_disorder_flag": disorder_flag,
+        "average_price": avg_price,
+    }
+
+
+def _source_confidence_score(
+    sample_count: int,
+    exact_match_ratio: float,
+    *,
+    blocked: bool,
+    disorder_flag: int,
+) -> float:
+    if blocked:
+        return 0.0
+    if sample_count <= 0:
+        return 0.0
+    sample_score = min(sample_count / 8, 1.0) * 40
+    match_score = max(0.0, min(exact_match_ratio, 1.0)) * 35
+    freshness_score = 15.0
+    stability_score = 10.0 if not disorder_flag else 4.0
+    return round(min(100.0, sample_score + match_score + freshness_score + stability_score), 1)
+
+
+def _confidence_level(score: float) -> str:
+    if score >= 80:
+        return "高"
+    if score >= 60:
+        return "中"
+    if score >= 40:
+        return "低"
+    return "弱"
+
+
+def _weighted_median(values: list[tuple[float, float]]) -> float:
+    filtered = [(price, weight) for price, weight in values if price > 0 and weight > 0]
+    if not filtered:
+        return 0.0
+    filtered.sort(key=lambda item: item[0])
+    total_weight = sum(weight for _, weight in filtered)
+    pivot = total_weight / 2
+    running = 0.0
+    for price, weight in filtered:
+        running += weight
+        if running >= pivot:
+            return round(price, 2)
+    return round(filtered[-1][0], 2)
+
+
+def _build_source_snapshot(
+    *,
+    sku: dict[str, Any],
+    platform: str,
+    filter_result: dict[str, Any] | None,
+    capture_mode: str,
+    blocked: bool,
+    error_message: str = "",
+    heat_score: float = 0.0,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    relevant_items = list((filter_result or {}).get("items") or [])
+    prices = _extract_prices_from_items(relevant_items)
+    stats = _summarize_source_prices(prices)
+    selected_count = int((filter_result or {}).get("selected_count") or 0)
+    strict_count = int((filter_result or {}).get("strict_count") or 0)
+    exact_match_ratio = round(strict_count / max(selected_count, 1), 4) if selected_count else 0.0
+
+    if blocked:
+        status = "被拦截"
+    elif stats["sample_count"] <= 0:
+        status = "无结果"
+    elif stats["sample_count"] < 3:
+        status = "样本不足"
+    elif normalize_text((filter_result or {}).get("quality")) == "exact":
+        status = "精确样本"
+    else:
+        status = "近似样本"
+
+    confidence_score = _source_confidence_score(
+        stats["sample_count"],
+        exact_match_ratio,
+        blocked=blocked,
+        disorder_flag=stats["price_disorder_flag"],
+    )
+
+    return {
+        "sku_id": int(sku.get("id") or 0),
+        "sku_code": normalize_text(sku.get("sku_code")),
+        "source_platform": platform,
+        "capture_mode": capture_mode,
+        "status": status,
+        "sample_count": stats["sample_count"],
+        "exact_match_ratio": exact_match_ratio,
+        "trimmed_mean_price": stats["trimmed_mean_price"],
+        "median_price": stats["median_price"],
+        "p10_price": stats["p10_price"],
+        "p90_price": stats["p90_price"],
+        "confidence_score": confidence_score,
+        "confidence_level": _confidence_level(confidence_score),
+        "heat_score": round(float(heat_score or 0), 1),
+        "blocked": 1 if blocked else 0,
+        "sample_prices": prices,
+        "matched_titles": list(dict.fromkeys(item.title for item in relevant_items))[:8],
+        "details": {
+            "selected_count": selected_count,
+            "strict_count": strict_count,
+            "medium_count": int((filter_result or {}).get("medium_count") or 0),
+            "loose_count": int((filter_result or {}).get("loose_count") or 0),
+            "quality": normalize_text((filter_result or {}).get("quality")),
+            "error_message": error_message,
+            **(details or {}),
+        },
+        "captured_at": now_iso(),
+    }
+
+
+def _aggregate_market_reference(
+    sku: dict[str, Any],
+    source_snapshots: list[dict[str, Any]],
+) -> dict[str, Any]:
+    eligible = [
+        item
+        for item in source_snapshots
+        if item.get("source_platform") in PRICE_REFERENCE_PLATFORM_WEIGHTS
+        and int(item.get("sample_count") or 0) > 0
+        and float(item.get("confidence_score") or 0) >= 50
+    ]
+    fallback_rows = [
+        item
+        for item in source_snapshots
+        if item.get("source_platform") in PRICE_REFERENCE_PLATFORM_WEIGHTS
+        and int(item.get("sample_count") or 0) > 0
+    ]
+    blocked_rows = [item for item in source_snapshots if item.get("blocked")]
+
+    source_count = len(eligible)
+    reference_price = 0.0
+    reference_low = 0.0
+    reference_high = 0.0
+    sample_count = 0
+    exact_ratio = 0.0
+    source_labels: list[str] = []
+    anchor_source = ""
+    status = "无结果"
+    source_mode = "无结果"
+
+    if eligible:
+        weighted_prices = [
+            (
+                float(item.get("median_price") or item.get("trimmed_mean_price") or 0),
+                PRICE_REFERENCE_PLATFORM_WEIGHTS.get(str(item.get("source_platform")), 0),
+            )
+            for item in eligible
+        ]
+        reference_price = _weighted_median(weighted_prices)
+        reference_low = round(min(float(item.get("p10_price") or item.get("median_price") or 0) for item in eligible), 2)
+        reference_high = round(max(float(item.get("p90_price") or item.get("median_price") or 0) for item in eligible), 2)
+        sample_count = sum(int(item.get("sample_count") or 0) for item in eligible)
+        weight_total = sum(PRICE_REFERENCE_PLATFORM_WEIGHTS.get(str(item.get("source_platform")), 0) for item in eligible) or 1
+        exact_ratio = sum(
+            float(item.get("exact_match_ratio") or 0) * PRICE_REFERENCE_PLATFORM_WEIGHTS.get(str(item.get("source_platform")), 0)
+            for item in eligible
+        ) / weight_total
+        source_labels = [PLATFORM_LABELS.get(str(item.get("source_platform")), str(item.get("source_platform"))) for item in eligible]
+        anchor_source = "多平台均衡" if source_count >= 2 else (source_labels[0] if source_labels else "单平台锚点")
+        status = "精确样本" if exact_ratio >= 0.7 else "近似样本"
+        source_mode = anchor_source
+    elif fallback_rows:
+        best_row = max(
+            fallback_rows,
+            key=lambda item: (float(item.get("confidence_score") or 0), int(item.get("sample_count") or 0)),
+        )
+        reference_price = round(float(best_row.get("median_price") or best_row.get("trimmed_mean_price") or 0), 2)
+        reference_low = round(float(best_row.get("p10_price") or best_row.get("median_price") or 0), 2)
+        reference_high = round(float(best_row.get("p90_price") or best_row.get("median_price") or 0), 2)
+        sample_count = int(best_row.get("sample_count") or 0)
+        exact_ratio = float(best_row.get("exact_match_ratio") or 0)
+        source_labels = [PLATFORM_LABELS.get(str(best_row.get("source_platform")), str(best_row.get("source_platform")))]
+        anchor_source = source_labels[0] if source_labels else "单平台锚点"
+        status = "样本不足" if sample_count < 3 else "近似样本"
+        source_mode = "弱可信单平台"
+    elif blocked_rows:
+        status = "被拦截"
+        source_mode = "抓取被拦截"
+
+    all_prices: list[float] = []
+    for item in eligible or fallback_rows:
+        all_prices.extend([float(value) for value in (item.get("sample_prices") or []) if float(value) > 0])
+    combined_stats = _summarize_source_prices(all_prices)
+    disorder_flag = int(combined_stats.get("price_disorder_flag") or 0)
+    if not disorder_flag and reference_low > 0 and reference_high > 0 and reference_high / max(reference_low, 0.01) >= 1.5:
+        disorder_flag = 1
+
+    if status == "无结果":
+        confidence_score = 0.0
+    elif status == "被拦截":
+        confidence_score = 0.0
+    else:
+        sample_score = min(sample_count / 15, 1.0) * 30
+        match_score = min(max(exact_ratio, 0.0), 1.0) * 25
+        freshness_score = 20.0
+        diversity_score = min(source_count / 3, 1.0) * 15
+        stability_score = 10.0 if not disorder_flag else 4.0
+        confidence_score = round(sample_score + match_score + freshness_score + diversity_score + stability_score, 1)
+        if source_count == 1:
+            confidence_score = max(0.0, round(confidence_score - 10.0, 1))
+
+    confidence_level = _confidence_level(confidence_score)
+    diagnostic_summary = "暂无可用市场参考。"
+    fallback_note = ""
+    if status == "精确样本":
+        diagnostic_summary = f"已形成{anchor_source}价格锚点，可直接用于定价建议。"
+    elif status == "近似样本":
+        diagnostic_summary = f"当前主要依赖{anchor_source}近似样本，建议配合人工复核。"
+    elif status == "样本不足":
+        diagnostic_summary = f"{anchor_source}样本数量偏少，当前只能作为弱参考。"
+    elif status == "被拦截":
+        diagnostic_summary = "市场抓取被拦截，当前没有形成有效价格锚点。"
+        fallback_note = "建议改用浏览器辅助采集或人工补样本。"
+
+    return {
+        "sku_id": int(sku.get("id") or 0),
+        "sku_code": normalize_text(sku.get("sku_code")),
+        "source_platform": "aggregate",
+        "capture_mode": "aggregate",
+        "status": status,
+        "sample_count": sample_count,
+        "exact_match_ratio": round(exact_ratio, 4),
+        "trimmed_mean_price": round(float(combined_stats.get("trimmed_mean_price") or reference_price or 0), 2),
+        "median_price": round(reference_price, 2),
+        "p10_price": round(reference_low, 2),
+        "p90_price": round(reference_high, 2),
+        "confidence_score": confidence_score,
+        "confidence_level": confidence_level,
+        "heat_score": round(_combine_platform_heat([float(item.get("heat_score") or 0) for item in source_snapshots if float(item.get("heat_score") or 0) > 0]), 1),
+        "blocked": 1 if status == "被拦截" else 0,
+        "sample_prices": all_prices[:30],
+        "matched_titles": list(
+            dict.fromkeys(
+                title
+                for item in eligible or fallback_rows
+                for title in (item.get("matched_titles") or [])
+            )
+        )[:10],
+        "details": {
+            "anchor_source": anchor_source,
+            "source_labels": source_labels,
+            "source_count": source_count,
+            "confidence_level": confidence_level,
+            "diagnostic_summary": diagnostic_summary,
+            "fallback_note": fallback_note,
+        },
+        "captured_at": now_iso(),
+        "price_disorder_flag": disorder_flag,
+        "reference_price": round(reference_price, 2),
+        "reference_low": round(reference_low, 2),
+        "reference_high": round(reference_high, 2),
+        "market_sample_status": status,
+        "market_source_mode": source_mode,
+        "diagnostic_summary": diagnostic_summary,
+        "fallback_note": fallback_note,
+    }
+
+
+def build_manual_source_snapshot(
+    *,
+    sku_id: int,
+    sku_code: str,
+    source_platform: str,
+    sample_prices: list[float],
+    source_urls: list[str] | None = None,
+    note: str = "",
+    confirmed: bool = True,
+) -> dict[str, Any]:
+    stats = _summarize_source_prices(sample_prices)
+    confidence = min(
+        58.0,
+        _source_confidence_score(
+            stats["sample_count"],
+            1.0 if confirmed else 0.75,
+            blocked=False,
+            disorder_flag=stats["price_disorder_flag"],
+        ),
+    )
+    return {
+        "sku_id": int(sku_id),
+        "sku_code": sku_code,
+        "source_platform": source_platform or "manual",
+        "capture_mode": "manual",
+        "status": "人工补样本",
+        "sample_count": stats["sample_count"],
+        "exact_match_ratio": 1.0 if confirmed else 0.75,
+        "trimmed_mean_price": stats["trimmed_mean_price"],
+        "median_price": stats["median_price"],
+        "p10_price": stats["p10_price"],
+        "p90_price": stats["p90_price"],
+        "confidence_score": round(confidence, 1),
+        "confidence_level": _confidence_level(confidence),
+        "heat_score": 0.0,
+        "blocked": 0,
+        "sample_prices": [round(float(value), 2) for value in sample_prices if float(value) > 0],
+        "matched_titles": [],
+        "details": {
+            "confirmed": 1 if confirmed else 0,
+            "source_urls": source_urls or [],
+            "note": note,
+        },
+        "captured_at": now_iso(),
+    }
+
+
+def _v3_refresh_market_snapshots(
+    *,
+    skus: list[dict[str, Any]],
+    cookies: dict[str, str] | None = None,
+    force: bool = False,
+    timeout: int = 16,
+    limit_per_platform: int = 10,
+) -> dict[str, Any]:
+    cookie_map = cookies or {}
+    snapshots: list[dict[str, Any]] = []
+    skipped = 0
+    errors: dict[str, str] = {}
+
+    for index, sku in enumerate(skus):
+        sample_status = normalize_text(sku.get("market_sample_status"))
+        has_reliable_samples = sample_status in {"精确样本", "人工补样本"} or (
+            not sample_status and int(sku.get("taobao_sample_count") or 0) > 0
+        )
+        if not force and is_snapshot_fresh(sku.get("market_snapshot_at")) and has_reliable_samples:
+            skipped += 1
+            continue
+        try:
+            snapshots.append(
+                _v3_build_market_snapshot_for_sku(
+                    sku,
+                    cookies=cookie_map,
+                    timeout=timeout,
+                    limit_per_platform=limit_per_platform,
+                    crawl_index=index,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - network/runtime boundary
+            sku_key = normalize_text(sku.get("sku_code")) or normalize_text(sku.get("product_name")) or f"sku-{index + 1}"
+            errors[sku_key] = str(exc)
+    return {
+        "snapshots": snapshots,
+        "refreshed": len(snapshots),
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def _v3_build_market_snapshot_for_sku(
+    sku: dict[str, Any],
+    *,
+    cookies: dict[str, str] | None = None,
+    timeout: int = 16,
+    limit_per_platform: int = 10,
+    crawl_index: int = 0,
+) -> dict[str, Any]:
+    cookie_map = cookies or {}
+    keyword = _build_market_query(sku)
+    platform_heat_scores: list[float] = []
+    platform_errors: dict[str, str] = {}
+    blocked_platforms: list[str] = []
+    taobao_limit = max(6, limit_per_platform)
+    taobao_queries = _build_market_queries(sku)
+    query_logs: list[dict[str, Any]] = []
+    matched_titles: list[str] = []
+    source_snapshots: list[dict[str, Any]] = []
+
+    for offset, platform in enumerate(MARKET_SNAPSHOT_PLATFORMS):
+        try:
+            _warm_up_platform(platform, "", timeout)
+            if platform == "taobao":
+                taobao_items: list[RawHotItem] = []
+                taobao_blocked = False
+                taobao_message = ""
+                used_cookie_fallback = False
+                taobao_query_logs: list[dict[str, Any]] = []
+                for query_index, query in enumerate(taobao_queries):
+                    items, attempt_report = _crawl_platform_with_cookie_fallback(
+                        platform,
+                        query,
+                        taobao_limit,
+                        cookie_map.get(platform, ""),
+                        timeout,
+                        pause_index=crawl_index + offset + query_index,
+                        slow_mode=True,
+                    )
+                    used_cookie_fallback = used_cookie_fallback or bool(attempt_report.get("used_cookie_fallback"))
+                    filter_result = _filter_relevant_market_items(items, sku, target_count=taobao_limit)
+                    relevant_items = filter_result["items"]
+                    query_entry = {
+                        "platform": "淘宝",
+                        "query": query,
+                        "raw_count": len(items),
+                        "strict_count": filter_result["strict_count"],
+                        "medium_count": filter_result["medium_count"],
+                        "loose_count": filter_result["loose_count"],
+                        "selected_count": len(relevant_items),
+                        "quality": filter_result["quality"],
+                        "mode": COOKIE_FALLBACK_LABEL if attempt_report["used_cookie_fallback"] else ANONYMOUS_LABEL,
+                    }
+                    query_logs.append(query_entry)
+                    taobao_query_logs.append(query_entry)
+                    if attempt_report["blocked"]:
+                        taobao_blocked = True
+                        taobao_message = attempt_report["message"] or "淘宝返回拦截页"
+                        platform_errors[platform] = taobao_message
+                        blocked_platforms.append(PLATFORM_LABELS.get(platform, platform))
+                        break
+                    if relevant_items:
+                        taobao_items.extend(relevant_items)
+                        taobao_items = _dedupe_market_items(taobao_items)
+                        matched_titles.extend(item.title for item in relevant_items[:3])
+                    if len(_extract_prices_from_items(taobao_items)) >= min(6, taobao_limit):
+                        break
+                taobao_filter = _filter_relevant_market_items(taobao_items, sku, target_count=taobao_limit)
+                taobao_heat = _aggregate_platform_heat(taobao_items[: min(len(taobao_items), 6)]) if taobao_items else 0.0
+                if taobao_heat > 0:
+                    platform_heat_scores.append(taobao_heat)
+                source_snapshots.append(
+                    _build_source_snapshot(
+                        sku=sku,
+                        platform="taobao",
+                        filter_result=taobao_filter,
+                        capture_mode="cookie_fallback" if used_cookie_fallback else "anonymous",
+                        blocked=taobao_blocked,
+                        error_message=taobao_message,
+                        heat_score=taobao_heat,
+                        details={"queries": taobao_query_logs},
+                    )
+                )
+                continue
+
+            items, attempt_report = _crawl_platform_with_cookie_fallback(
+                platform,
+                keyword,
+                limit_per_platform,
+                cookie_map.get(platform, ""),
+                timeout,
+                pause_index=crawl_index + offset,
+                slow_mode=True,
+            )
+            filter_result = _filter_relevant_market_items(items, sku, target_count=limit_per_platform)
+            relevant_items = filter_result["items"]
+            query_logs.append(
+                {
+                    "platform": PLATFORM_LABELS.get(platform, platform),
+                    "query": keyword,
+                    "raw_count": len(items),
+                    "strict_count": filter_result["strict_count"],
+                    "medium_count": filter_result["medium_count"],
+                    "loose_count": filter_result["loose_count"],
+                    "selected_count": len(relevant_items),
+                    "quality": filter_result["quality"],
+                    "mode": COOKIE_FALLBACK_LABEL if attempt_report["used_cookie_fallback"] else ANONYMOUS_LABEL,
+                }
+            )
+            if attempt_report["blocked"]:
+                platform_errors[platform] = attempt_report["message"] or "平台返回拦截页"
+                blocked_platforms.append(PLATFORM_LABELS.get(platform, platform))
+            if relevant_items:
+                matched_titles.extend(item.title for item in relevant_items[:2])
+            platform_heat = _aggregate_platform_heat(relevant_items[: min(len(relevant_items), 6)]) if relevant_items else 0.0
+            if platform_heat > 0:
+                platform_heat_scores.append(platform_heat)
+            source_snapshots.append(
+                _build_source_snapshot(
+                    sku=sku,
+                    platform=platform,
+                    filter_result=filter_result,
+                    capture_mode="cookie_fallback" if attempt_report["used_cookie_fallback"] else "anonymous",
+                    blocked=bool(attempt_report.get("blocked")),
+                    error_message=normalize_text(attempt_report.get("message")),
+                    heat_score=platform_heat,
+                    details={"query": keyword},
+                )
+            )
+        except Exception as exc:  # pragma: no cover - network/runtime boundary
+            platform_errors[platform] = str(exc)
+            source_snapshots.append(
+                _build_source_snapshot(
+                    sku=sku,
+                    platform=platform,
+                    filter_result={
+                        "items": [],
+                        "quality": "none",
+                        "selected_count": 0,
+                        "strict_count": 0,
+                        "medium_count": 0,
+                        "loose_count": 0,
+                    },
+                    capture_mode="anonymous",
+                    blocked=_is_block_message(str(exc)),
+                    error_message=str(exc),
+                    heat_score=0.0,
+                )
+            )
+            if _is_block_message(str(exc)):
+                blocked_platforms.append(PLATFORM_LABELS.get(platform, platform))
+
+    aggregate_reference = _aggregate_market_reference(sku, source_snapshots)
+    sample_source_prices = [float(value) for value in (aggregate_reference.get("sample_prices") or []) if float(value) > 0]
+    avg_price, min_price, max_price, sample_count, disorder_flag = _summarize_price_samples(sample_source_prices)
+    online_heat_score = round(
+        _combine_platform_heat([float(aggregate_reference.get("heat_score") or 0)] + platform_heat_scores),
+        1,
+    )
+    matched_titles = list(
+        dict.fromkeys(
+            matched_titles
+            + (aggregate_reference.get("matched_titles") or [])
+            + [title for row in source_snapshots for title in (row.get("matched_titles") or [])[:2]]
+        )
+    )[:10]
+    return {
+        "id": sku.get("id"),
+        "sku_code": normalize_text(sku.get("sku_code")),
+        "keyword": keyword,
+        "taobao_avg_price": avg_price,
+        "taobao_min_price": min_price,
+        "taobao_max_price": max_price,
+        "taobao_sample_count": sample_count,
+        "price_disorder_flag": disorder_flag,
+        "online_heat_score": online_heat_score,
+        "market_snapshot_at": now_iso(),
+        "market_sample_status": normalize_text(aggregate_reference.get("market_sample_status")),
+        "market_source_mode": normalize_text(aggregate_reference.get("market_source_mode")),
+        "market_anchor_source": normalize_text((aggregate_reference.get("details") or {}).get("anchor_source")),
+        "market_confidence_score": float(aggregate_reference.get("confidence_score") or 0),
+        "market_confidence_level": normalize_text(aggregate_reference.get("confidence_level")),
+        "market_reference_price": float(aggregate_reference.get("reference_price") or avg_price or 0),
+        "market_reference_low": float(aggregate_reference.get("reference_low") or min_price or 0),
+        "market_reference_high": float(aggregate_reference.get("reference_high") or max_price or 0),
+        "diagnostic_summary": normalize_text(aggregate_reference.get("diagnostic_summary")),
+        "query_logs": query_logs,
+        "blocked_platforms": list(dict.fromkeys(blocked_platforms)),
+        "fallback_note": normalize_text(aggregate_reference.get("fallback_note")),
+        "matched_titles": list(dict.fromkeys(matched_titles))[:8],
+        "errors": {
+            PLATFORM_LABELS.get(platform, platform): message
+            for platform, message in platform_errors.items()
+        },
+        "source_snapshots": source_snapshots,
+        "aggregate_reference": aggregate_reference,
+    }
+
+
+refresh_market_snapshots = _v3_refresh_market_snapshots
+build_market_snapshot_for_sku = _v3_build_market_snapshot_for_sku
+
+
+_ORIGINAL_AGGREGATE_MARKET_REFERENCE = _aggregate_market_reference
+
+
+def _aggregate_market_reference_v3(
+    sku: dict[str, Any],
+    source_snapshots: list[dict[str, Any]],
+) -> dict[str, Any]:
+    result = _ORIGINAL_AGGREGATE_MARKET_REFERENCE(sku, source_snapshots)
+    priced_sources = [
+        item
+        for item in source_snapshots
+        if item.get("source_platform") in PRICE_REFERENCE_PLATFORM_WEIGHTS
+        and int(item.get("sample_count") or 0) > 0
+    ]
+    has_taobao_source = any(item.get("source_platform") == "taobao" for item in priced_sources)
+    if priced_sources and not has_taobao_source:
+        confidence_score = min(float(result.get("confidence_score") or 0), 59.0) or 48.0
+        result.update(
+            {
+                "status": "跨平台替代",
+                "market_sample_status": "跨平台替代",
+                "market_source_mode": "跨平台替代",
+                "confidence_score": confidence_score,
+                "confidence_level": _confidence_level(confidence_score),
+                "details": {
+                    **(result.get("details") or {}),
+                    "anchor_source": "跨平台替代",
+                    "diagnostic_summary": "当前没有形成有效淘宝样本，价格锚点由京东/天猫等跨平台样本替代。",
+                    "fallback_note": "建议继续补淘宝样本或人工补样本，提高定价可信度。",
+                },
+                "diagnostic_summary": "当前没有形成有效淘宝样本，价格锚点由京东/天猫等跨平台样本替代。",
+                "fallback_note": "建议继续补淘宝样本或人工补样本，提高定价可信度。",
+            }
+        )
+    return result
+
+
+_aggregate_market_reference = _aggregate_market_reference_v3

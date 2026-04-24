@@ -215,8 +215,22 @@ body {
   gap: 18px;
 }
 
+.overview-layout {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr;
+  gap: 18px;
+}
+
+.overview-kpi-grid {
+  margin-bottom: 18px;
+}
+
 .candidate-layout {
   grid-template-columns: 1fr 1.1fr;
+}
+
+.comparison-workbench {
+  min-height: 100%;
 }
 
 .crawl-card {
@@ -229,6 +243,15 @@ body {
 
 .helper-card {
   min-height: 100%;
+}
+
+.tool-details {
+  margin-top: 18px;
+}
+
+.tool-details summary {
+  cursor: pointer;
+  font-weight: 600;
 }
 
 .crawl-platforms {
@@ -315,6 +338,18 @@ textarea {
 
 textarea {
   resize: vertical;
+}
+
+.table-input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(46, 72, 46, 0.12);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.top-gap {
+  margin-top: 8px;
 }
 
 .primary-btn,
@@ -610,6 +645,10 @@ th {
   border: 1px solid rgba(46, 72, 46, 0.08);
 }
 
+.compact-stack {
+  gap: 10px;
+}
+
 .pricing-details summary,
 .inline-detail summary {
   cursor: pointer;
@@ -692,6 +731,7 @@ th {
 @media (max-width: 1120px) {
   .hero,
   .two-column,
+  .overview-layout,
   .comparison-grid,
   .dashboard-grid,
   .crawl-preview-grid,
